@@ -658,6 +658,18 @@ class MultiVideoRosBag2LeRobotConverter:
         self.max_pending = 2 * self._encode_workers
 
 
+    @staticmethod
+    def _find_bag_files(directory):
+        """Find .db3 or .mcap bag files in a directory, skipping macOS
+        AppleDouble sidecar files (e.g. '._rec_xxx.mcap') that would
+        otherwise be globbed alongside the real recording and cause it
+        to be processed twice."""
+        directory = Path(directory)
+        db3_files = [f for f in directory.glob("*.db3") if not f.name.startswith("._")]
+        if db3_files:
+            return db3_files
+        return [f for f in directory.glob("*.mcap") if not f.name.startswith("._")]
+
     def discover_rosbags(self, MULTIBAG_FLAG, verbose: bool = False):
         """Discover all ROS2 bags in the input directory."""
         rosbags = []
@@ -692,7 +704,7 @@ class MultiVideoRosBag2LeRobotConverter:
                 # Find .db3 or .mcap files in rosbag directory
                 for rosbag_dir in rosbag_folders:
                     rosbag_dir = Path(rosbag_dir)
-                    db3_files = list(rosbag_dir.glob("*.db3")) or list(rosbag_dir.glob("*.mcap"))
+                    db3_files = self._find_bag_files(rosbag_dir)
                     if db3_files:
                         for db3_file in db3_files:
                             rosbags.append({
@@ -703,7 +715,7 @@ class MultiVideoRosBag2LeRobotConverter:
 
         else:
             # one rosbag
-            db3_files = list(self.input_directory.glob("*.db3")) or list(self.input_directory.glob("*.mcap"))
+            db3_files = self._find_bag_files(self.input_directory)
             for i, db3_file in enumerate(sorted(db3_files)):
                 rosbags.append({
                     'name': f"episode_{i:03d}",
