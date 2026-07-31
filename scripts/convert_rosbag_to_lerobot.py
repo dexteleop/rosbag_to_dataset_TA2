@@ -136,6 +136,11 @@ MIN_EPISODE_LENGTH = 30
 # width). Must stay < 1/fps.
 ACTION_OFFSET_S = 1.0 / 90.0
 
+# 3x Y right after stopping = operator marks that episode as failed.
+# Real bags: burst gaps <=5s, distinct-episode gaps >=13s, so 6s separates them.
+Y_FAILURE_TAP_WINDOW_S = 6.0
+Y_FAILURE_TAP_COUNT = 3
+
 
 # =============================================================================
 # HEVC NAL unit utilities (for IDR detection)
@@ -1385,11 +1390,38 @@ class MultiVideoRosBag2LeRobotConverter:
         episode_action_target_t = None
         is_in_adding_phase = False
 
+        # Episode just stopped by Y; submission held until the failure-tap window resolves.
+        pending_stop = None
+
+        def _finalize_pending_stop():
+            nonlocal pending_stop
+            if pending_stop is None:
+                return
+            taps = pending_stop['taps']
+            if taps >= Y_FAILURE_TAP_COUNT:
+                self.dataset.clear_episode_buffer()
+                pending_stop['packet_buffer'].clear()
+                self.logger.warning(f"  🗑️ Episode discarded: operator marked it failed ({taps}x Y)")
+            else:
+                if taps == 2:
+                    self.logger.warning(
+                        "  ⚠️ Got exactly 2 Y taps (1=normal stop, 3=failed) — "
+                        "ambiguous, keeping episode as successful; please double-check"
+                    )
+                self._submit_episode(
+                    pending_stop['packet_buffer'], pending_stop['start_time'],
+                    pending_stop['end_time'], task_description
+                )
+            pending_stop = None
+
         while reader.has_next():
             _t = time.perf_counter()
             (topic, data, timestamp) = reader.read_next()
             self._perf['read_next'] += time.perf_counter() - _t
             timestamp = timestamp / 1e9
+
+            if pending_stop is not None and timestamp - pending_stop['last_tap_t'] >= Y_FAILURE_TAP_WINDOW_S:
+                _finalize_pending_stop()
 
             _t = time.perf_counter()
             self.update_messages(topic, data)
@@ -1426,6 +1458,8 @@ class MultiVideoRosBag2LeRobotConverter:
                     if len(buttons) > max(x_button, y_button):
                         if previous_buttons is not None:
                             if   (previous_buttons[x_button] == 0 and buttons[x_button] == 1 and not is_recording):
+                                _finalize_pending_stop()
+
                                 is_recording = True
                                 start_time = timestamp
                                 self.logger.info(f"🔴 Start #Episode: {self.num_xy_pairs}")
@@ -1454,10 +1488,21 @@ class MultiVideoRosBag2LeRobotConverter:
                             if (previous_buttons[y_button] == 0 and buttons[y_button] == 1 and is_recording):
                                 is_recording = False
                                 end_time = timestamp
-                                self._submit_episode(packet_buffer, start_time, end_time, task_description)
+                                pending_stop = {
+                                    'packet_buffer': packet_buffer,
+                                    'start_time': start_time,
+                                    'end_time': end_time,
+                                    'taps': 1,
+                                    'last_tap_t': end_time,
+                                }
 
                                 episode_state_target_t = None
                                 episode_action_target_t = None
+
+                            elif (previous_buttons[y_button] == 0 and buttons[y_button] == 1
+                                  and not is_recording and pending_stop is not None):
+                                pending_stop['taps'] += 1
+                                pending_stop['last_tap_t'] = timestamp
 
                         previous_buttons = list(buttons)
 
@@ -1527,6 +1572,9 @@ class MultiVideoRosBag2LeRobotConverter:
                     episode_action_target_t = episode_state_target_t + ACTION_OFFSET_S
 
                     frame_data.clear()
+
+        # Bag ended before the burst window closed on the last stop — settle it now.
+        _finalize_pending_stop()
 
         # Wait for all in-flight episode encodes and save them
         self._drain_pending(block=True)
