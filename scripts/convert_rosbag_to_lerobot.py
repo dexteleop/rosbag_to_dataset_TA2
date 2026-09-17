@@ -1222,6 +1222,45 @@ class MultiVideoRosBag2LeRobotConverter:
             + " | ".join(f"{k}={v:.2f}s" for k, v in sorted(self._perf.items()))
         )
 
+    def _open_bag_reader(self, rosbag):
+        """Open a bag, falling back to the storage file when metadata.yaml fails.
+
+        An mcap carries its own summary, so a broken metadata.yaml is
+        recoverable for a single-file bag. With several files metadata.yaml is
+        the only record of which belong together — reading one directly would
+        convert part of the recording and report success, so refuse instead.
+        """
+        bag_file = rosbag['bag_file']
+        storage_id = 'mcap' if bag_file.endswith('.mcap') else 'sqlite3'
+
+        def _open(uri):
+            reader = SequentialReader()
+            reader.open(StorageOptions(uri=uri, storage_id=storage_id), ConverterOptions('', ''))
+            return reader
+
+        try:
+            return _open(rosbag['path'])
+        except Exception as dir_err:
+            parts = self._find_bag_files(Path(rosbag['path']))
+            if len(parts) != 1:
+                raise RuntimeError(
+                    f"cannot open via metadata.yaml ({dir_err}); the directory holds "
+                    f"{len(parts)} storage files and metadata.yaml is the only record of "
+                    f"how they fit together, so reading one directly would convert part "
+                    f"of the recording. Repair metadata.yaml for this bag."
+                ) from dir_err
+            try:
+                reader = _open(bag_file)
+            except Exception as file_err:
+                raise RuntimeError(
+                    f"cannot open as a directory ({dir_err}) nor as a file ({file_err})"
+                ) from file_err
+            self.logger.warning(
+                f"  ⚠️ {rosbag['name']}: metadata.yaml unusable ({dir_err}); read "
+                f"{Path(bag_file).name} directly. Single-file bag, so nothing is lost."
+            )
+            return reader
+
     def convert_single_bag(self, rosbag, task_description: str, ENFORCE_ALL_VIDEO_TOPICS_FLAG: bool, WHOLE_BAG_FLAG: bool = False):
         """Convert a single bag to one or multiple episodes in the dataset."""
         self.logger.info(f"\n=== Processing {rosbag['name']} ===")
@@ -1230,18 +1269,13 @@ class MultiVideoRosBag2LeRobotConverter:
 
         # Initialize ROS2 bag reader
         try:
-            bag_file = rosbag['bag_file']
-            storage_id = 'mcap' if bag_file.endswith('.mcap') else 'sqlite3'
-            storage_options = StorageOptions(uri=rosbag['path'], storage_id=storage_id)
-            converter_options = ConverterOptions('','')
-            reader = SequentialReader()
-            reader.open(storage_options, converter_options)
+            reader = self._open_bag_reader(rosbag)
         except Exception as e:
             error_msg = f"Failed to open {rosbag['bag_file']} in {rosbag['name']}: {e}\n"
             error_msg += f"Traceback (most recent call last):\n"
             error_msg += traceback.format_exc()
             self.logger.error(error_msg)
-            return
+            return f"failed to open: {e}"
 
         # Get topic types
         self.topic_types_dict = {}
@@ -1264,7 +1298,7 @@ class MultiVideoRosBag2LeRobotConverter:
                 if video_topic_name not in self.topic_types_dict:
                     del reader
                     shutil.rmtree(self.dataset.root/'images', ignore_errors=True)
-                    return
+                    return f"missing video topic {video_topic_name}"
 
         # Only pull topics we actually consume from the storage layer — this
         # skips /tf and other high-rate topics on the C++ side instead of
@@ -1403,7 +1437,7 @@ class MultiVideoRosBag2LeRobotConverter:
 
             del reader
             shutil.rmtree(self.dataset.root/'images', ignore_errors=True)
-            return
+            return None
 
         # =====================================================================
         # X/Y MARKER MODE: Joy-based episode detection.
@@ -1560,7 +1594,7 @@ class MultiVideoRosBag2LeRobotConverter:
                     self._drain_pending(block=True)
                     del reader
                     shutil.rmtree(self.dataset.root/'images', ignore_errors=True)
-                    return
+                    return None
 
             if is_recording:
                 if   timestamp < episode_state_target_t:
@@ -1621,6 +1655,7 @@ class MultiVideoRosBag2LeRobotConverter:
             f"[PERF bag total] wall={time.perf_counter() - _t_bag:.2f}s | "
             + " | ".join(f"{k}={v:.2f}s" for k, v in sorted(self._perf.items()))
         )
+        return None
 
 
     def convert_all(self, task_description: str, MULTIBAG_FLAG: bool, ENFORCE_ALL_VIDEO_TOPICS_FLAG: bool, WHOLE_BAG_FLAG: bool = False):
@@ -1638,22 +1673,45 @@ class MultiVideoRosBag2LeRobotConverter:
         # Create the dataset
         self.create_dataset_if_needed()
 
-        # Convert each rosbag
+        # Convert each rosbag. A bag that does not convert is reported and
+        # counted: silently dropping it leaves a dataset quietly short of those
+        # episodes, with nothing but one line in a long log to say so.
         processed_rosbags = 0
+        skipped: list[tuple[str, str]] = []
         for rosbag in rosbags:
-            self.convert_single_bag(rosbag, task_description, ENFORCE_ALL_VIDEO_TOPICS_FLAG, WHOLE_BAG_FLAG)
+            reason = self.convert_single_bag(
+                rosbag, task_description, ENFORCE_ALL_VIDEO_TOPICS_FLAG, WHOLE_BAG_FLAG
+            )
             processed_rosbags += 1
-            self.logger.info(f"[{processed_rosbags}/{total_rosbags}] Finished processing rosbag: {rosbag.get('name')}")
+            if reason is None:
+                self.logger.info(f"[{processed_rosbags}/{total_rosbags}] Finished processing rosbag: {rosbag.get('name')}")
+            else:
+                skipped.append((str(rosbag.get('name')), reason))
+                self.logger.error(
+                    f"[{processed_rosbags}/{total_rosbags}] SKIPPED rosbag: "
+                    f"{rosbag.get('name')} — {reason}"
+                )
 
         # All per-bag work is drained; shut the encode workers down cleanly
         self._encode_pool.shutdown(wait=True)
 
         # Final summary
         elapsed = time.time() - self._t_start
-        self.logger.info(f"\n🎉 Multi-bag conversion complete!")
+        converted = total_rosbags - len(skipped)
+        if skipped:
+            self.logger.error(f"\n⚠️ Multi-bag conversion finished with {len(skipped)} skipped bag(s)!")
+        else:
+            self.logger.info(f"\n🎉 Multi-bag conversion complete!")
         self.logger.info(f"   Dataset: {self.output_repo_id}")
+        self.logger.info(f"   Bags: {converted}/{total_rosbags} converted")
         self.logger.info(f"   Episodes: {self.dataset.num_episodes} successful")
         self.logger.info(f"   Total time: {elapsed:.1f}s")
+        if skipped:
+            self.logger.error(f"   {len(skipped)} bag(s) produced no episodes:")
+            for name, reason in skipped:
+                self.logger.error(f"     - {name}: {reason}")
+            return False
+        return True
 
 
 def setup_logging_to_file(log_file_path):
@@ -1754,7 +1812,8 @@ def main():
             sys.exit(1)
         converter = MultiVideoRosBag2LeRobotConverter(args.input_directory, args.output, args.fps, crf=args.crf)
         converter.max_episodes = args.max_episodes
-        converter.convert_all(args.task, args.multibag, args.enforce_all_video_topics, args.whole_bag)
+        if not converter.convert_all(args.task, args.multibag, args.enforce_all_video_topics, args.whole_bag):
+            sys.exit(1)
     else:
         # Log file mode: redirect to file (original behavior)
         if args.log_file is None:
@@ -1767,18 +1826,21 @@ def main():
             log_file_path = Path(args.log_file)
 
         log_file = setup_logging_to_file(log_file_path)
+        ok = False
         try:
             if not os.path.exists(args.input_directory):
                 print(f"Error: Input directory {args.input_directory} not found!")
                 sys.exit(1)
             converter = MultiVideoRosBag2LeRobotConverter(args.input_directory, args.output, args.fps, crf=args.crf)
-            converter.convert_all(args.task, args.multibag, args.enforce_all_video_topics, args.whole_bag)
+            ok = converter.convert_all(args.task, args.multibag, args.enforce_all_video_topics, args.whole_bag)
         finally:
             sys.stdout.flush()
             sys.stderr.flush()
             log_file.close()
             sys.stdout = sys.__stdout__
             sys.stderr = sys.__stderr__
+        if not ok:
+            sys.exit(1)
 
 
 if __name__ == "__main__":

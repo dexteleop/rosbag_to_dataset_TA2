@@ -104,6 +104,38 @@ def discover_rosbags(input_directory: Path, multibag: bool):
     return rosbags
 
 
+def open_bag_reader(rosbag: dict, logger: logging.Logger):
+    """Open a bag, falling back to the storage file when metadata.yaml fails.
+
+    Mirrors the converter: an mcap carries its own summary, so a broken
+    metadata.yaml is recoverable for a single-file bag. With several files
+    metadata.yaml is the only record of which belong together, so refuse.
+    """
+    path = Path(rosbag['path'])
+    bag_file = rosbag['bag_file']
+    storage_id = 'mcap' if bag_file.endswith('.mcap') else 'sqlite3'
+
+    def _open(uri: str):
+        reader = SequentialReader()
+        reader.open(StorageOptions(uri=uri, storage_id=storage_id), ConverterOptions('', ''))
+        return reader
+
+    try:
+        return _open(str(path))
+    except Exception as dir_err:
+        suffix = '.db3' if storage_id == 'sqlite3' else '.mcap'
+        # '._*' are macOS AppleDouble sidecars, not bag segments
+        parts = [f for f in path.glob(f"*{suffix}") if not f.name.startswith('._')]
+        if len(parts) != 1:
+            raise RuntimeError(
+                f"cannot open via metadata.yaml ({dir_err}); {len(parts)} storage files "
+                f"present and metadata.yaml is the only record of how they fit together"
+            ) from dir_err
+        reader = _open(bag_file)
+        logger.warning(f"    metadata.yaml unusable ({dir_err}); read {Path(bag_file).name} directly")
+        return reader
+
+
 def get_bag_size_bytes(bag_path: str) -> int:
     return sum(f.stat().st_size for f in Path(bag_path).rglob('*') if f.is_file())
 
@@ -118,11 +150,7 @@ def scan_single_bag(rosbag: dict, fps: int, logger: logging.Logger):
     """
     bag_file = rosbag['bag_file']
     storage_id = 'mcap' if bag_file.endswith('.mcap') else 'sqlite3'
-    reader = SequentialReader()
-    reader.open(
-        StorageOptions(uri=rosbag['path'], storage_id=storage_id),
-        ConverterOptions('', ''),
-    )
+    reader = open_bag_reader(rosbag, logger)
 
     topic_types = reader.get_all_topics_and_types()
     topics_found = {tm.name for tm in topic_types}
@@ -283,6 +311,7 @@ def main():
     for rb in rosbags:
         logger.info(f"  - {rb['name']}: {rb['bag_file']}")
 
+    failed: list[tuple[str, str]] = []
     total_size_bytes = 0
     total_bag_duration_s = 0.0
     all_total_segments = 0
@@ -296,6 +325,7 @@ def main():
             stats = scan_single_bag(rosbag, args.fps, logger)
         except Exception as e:
             logger.error(f"扫描失败: {rosbag['name']}: {e}")
+            failed.append((rosbag['name'], str(e)))
             continue
 
         total_size_bytes += stats['bag_size_bytes']
@@ -330,6 +360,7 @@ def main():
     logger.info(f"  任务                 : {args.task}")
     logger.info(f"  目标 FPS             : {args.fps}")
     logger.info(f"  Rosbag 数量          : {len(rosbags)}")
+    logger.info(f"  扫描成功 / 失败      : {len(rosbags) - len(failed)} / {len(failed)}")
     logger.info(f"  原始 rosbag 总大小   : {fmt_size(total_size_bytes)}")
     logger.info(f"  原始 rosbag 总时长   : {fmt_duration(total_bag_duration_s)}  ({total_bag_duration_s:.1f}s)")
     logger.info(f"  总数据片段           : {all_total_segments} 段")
@@ -348,6 +379,13 @@ def main():
     for t in sorted(all_topics):
         logger.info(f"    {t}")
     logger.info(sep)
+
+    if failed:
+        logger.error(f"\n  {len(failed)} 个 rosbag 扫描失败，上面的统计不包含它们:")
+        for name, reason in failed:
+            logger.error(f"    - {name}: {reason}")
+        logger.error(sep)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
