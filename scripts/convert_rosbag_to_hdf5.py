@@ -171,8 +171,8 @@ class MultiVideoRosBag2HDF5Converter:
         self.chassis_topics_set = {self.chassis_state_topic, self.chassis_action_topic}
         # Action topics set
         self.action_topics_set = {
-            '/left_arm/joint_cmd', '/left_arm/target_ee_pose', '/left_gripper/joint_cmd',
-            '/right_arm/joint_cmd','/right_arm/target_ee_pose','/right_gripper/joint_cmd',
+            '/left_arm/joint_cmd', '/left_target_ee_pose', '/left_gripper/joint_cmd',
+            '/right_arm/joint_cmd','/right_target_ee_pose','/right_gripper/joint_cmd',
         }
         # All topics set
         self.all_topics_set = (self.video_topics_set | self.state_topics_set
@@ -907,11 +907,11 @@ class MultiVideoRosBag2HDF5Converter:
             self._cur_action_msg[31] = gripper_data[1]
             self._cur_action_msg[47] = gripper_data[2]
 
-        elif topicName == '/left_arm/target_ee_pose':
+        elif topicName == '/left_target_ee_pose':
             ee_pose_data = self.extract_ee_pose_data(msg)
             self._cur_action_msg[48:55] = ee_pose_data
 
-        elif topicName == '/right_arm/target_ee_pose':
+        elif topicName == '/right_target_ee_pose':
             ee_pose_data = self.extract_ee_pose_data(msg)
             self._cur_action_msg[55:62] = ee_pose_data
 

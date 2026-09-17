@@ -104,7 +104,7 @@ All converters accept both rosbag2 storage formats and pick the storage plugin a
 | Video (HEVC `FFMPEGPacket`) | `/left/color/image_raw/ffmpeg`, `/right/color/image_raw/ffmpeg`, `/xr_video_topic/ffmpeg` (head) |
 | Camera info | `/left/color/camera_info`, `/right/color/camera_info` |
 | State (62 dims) | `/left_arm/joint_states`, `/right_arm/joint_states`, `/left_gripper/joint_states`, `/right_gripper/joint_states`, `/left_arm/current_ee_pose`, `/right_arm/current_ee_pose` |
-| Action (62 dims) | `/left_arm/joint_cmd`, `/right_arm/joint_cmd`, `/left_gripper/joint_cmd`, `/right_gripper/joint_cmd`, `/left_arm/target_ee_pose`, `/right_arm/target_ee_pose` |
+| Action (62 dims) | `/left_arm/joint_cmd`, `/right_arm/joint_cmd`, `/left_gripper/joint_cmd`, `/right_gripper/joint_cmd`, `/left_target_ee_pose`, `/right_target_ee_pose` |
 | Chassis (9 dims) | `/chassis/joint_states` (state), `/chassis/joint_cmd` (action) |
 | Kinco lift (1 dim, LeRobot converter) | `/kinco/actual_velocity` (state), `/kinco/cmd_velocity` (action) |
 
