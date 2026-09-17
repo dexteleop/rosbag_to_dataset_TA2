@@ -18,6 +18,10 @@ Usage example:
 
     # Only act on category-1 (jump) episodes, leave category-2 (length) alone
     python scripts/confirm_and_delete_episodes.py --dataset /path/to/dataset --category 1
+
+    # Web/pipeline: delete an explicit episode list (skips report-based selection)
+    python scripts/confirm_and_delete_episodes.py \\
+      --dataset /path/to/dataset --episodes-file approved.json --yes
 """
 import argparse
 import json
@@ -36,6 +40,30 @@ def load_report(report_path: Path) -> dict:
             f"Report not found: {report_path}. Run detect_suspicious_episodes.py first."
         )
     return json.loads(report_path.read_text(encoding="utf-8"))
+
+
+def load_episodes_file(path: Path) -> list[int]:
+    """Load approved episode indices from JSON.
+
+    Accepted shapes:
+      {"episodes": [21, 77, 215]}
+      [21, 77, 215]
+    """
+    if not path.exists():
+        raise FileNotFoundError(f"Episodes file not found: {path}")
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(data, dict):
+        episodes = data.get("episodes")
+        if episodes is None:
+            raise ValueError(f"{path} must contain an 'episodes' list")
+    elif isinstance(data, list):
+        episodes = data
+    else:
+        raise ValueError(f"Unsupported episodes-file format in {path}")
+    indices = sorted({int(x) for x in episodes})
+    if not indices:
+        raise ValueError(f"No episode indices found in {path}")
+    return indices
 
 
 def select_candidates(report: dict, categories: list[int]) -> list[dict]:
@@ -71,6 +99,9 @@ def parse_args() -> argparse.Namespace:
                          help="Path to suspicious_episodes.json (default: <dataset>/meta/suspicious_episodes.json).")
     parser.add_argument("--category", type=int, nargs="+", choices=[1, 2], default=[1, 2],
                          help="Which categories to act on: 1=jump, 2=length (default: both).")
+    parser.add_argument("--episodes-file", type=Path, default=None,
+                         help="JSON file with explicit episode indices to delete "
+                              '(e.g. {"episodes": [21, 77]}). Skips report-based selection.')
     parser.add_argument("--yes", action="store_true",
                          help="Skip the confirmation prompt and delete every selected episode.")
     return parser.parse_args()
@@ -81,6 +112,16 @@ def main() -> None:
     dataset = args.dataset.resolve()
     if not dataset.exists():
         raise FileNotFoundError(f"Dataset directory does not exist: {dataset}")
+
+    if args.episodes_file is not None:
+        episode_indices = load_episodes_file(args.episodes_file)
+        print(f"Dataset: {dataset}")
+        print(f"{len(episode_indices)} episode(s) from {args.episodes_file}: {episode_indices}")
+        if not args.yes and not confirm(f"\nDelete these {len(episode_indices)} episode(s)?"):
+            print("Aborted: no episodes deleted.")
+            return
+        remove_episodes(dataset, episode_indices)
+        return
 
     report_path = args.report or (dataset / "meta" / "suspicious_episodes.json")
     report = load_report(report_path)
