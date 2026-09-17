@@ -130,7 +130,10 @@ except ImportError as e:
     sys.exit(1)
 
 # Constants
-STATE_ACTION_DIM = 72  # 62 base + 10 chassis/kinco (same indices for state & action)
+STATE_ACTION_DIM = 76  # 62 base + 10 chassis/kinco + 4 unpaired (see setup_features)
+# Dims 72-75 have no counterpart on the other side: chassis_target_vel is
+# command-only and kinco_position is feedback-only. The layout stays shared
+# between state and action, so each simply reads 0 where it has no source.
 MIN_EPISODE_LENGTH = 30
 # State->action capture offset in seconds (also the state-capture window
 # width). Must stay < 1/fps.
@@ -615,12 +618,14 @@ class MultiVideoRosBag2LeRobotConverter:
             '/left_arm/joint_states', '/left_arm/current_ee_pose', '/left_gripper/joint_states',
             '/right_arm/joint_states','/right_arm/current_ee_pose','/right_gripper/joint_states',
             '/chassis/joint_states', '/kinco/actual_velocity',
+            '/kinco/actual_position',
         }
         # Action topics set
         self.action_topics_set = {
             '/left_arm/joint_cmd', '/left_target_ee_pose', '/left_gripper/joint_cmd',
             '/right_arm/joint_cmd','/right_target_ee_pose','/right_gripper/joint_cmd',
             '/chassis/joint_cmd', '/kinco/cmd_velocity',
+            '/chassis_target_vel',
         }
         # All topics set
         self.all_topics_set = self.video_topics_set | self.state_topics_set | self.action_topics_set
@@ -743,10 +748,10 @@ class MultiVideoRosBag2LeRobotConverter:
             return (800, 2560, 3)  # Stereo cameras
 
     def setup_features(self):
-        """Setup LeRobot dataset features with 48-dim data + video features."""
+        """Setup LeRobot dataset features with STATE_ACTION_DIM state/action dims + video features."""
         features = {}
 
-        # Complete 48-dimensional feature names
+        # Complete STATE_ACTION_DIM-dimensional feature names
         feature_names = [
             # Joint positions (16)
             "left_joint1_position", "left_joint2_position", "left_joint3_position", "left_joint4_position",
@@ -773,6 +778,15 @@ class MultiVideoRosBag2LeRobotConverter:
             "chassis_motor1_velocity", "chassis_motor2_velocity", "chassis_motor3_velocity",
             "chassis_motor1_effort", "chassis_motor2_effort", "chassis_motor3_effort",
             "kinco_velocity",
+            # Unpaired (4 dims). Each is written by one side only; the other
+            # side keeps the 0 it was initialised with.
+            # state only — /kinco/actual_position (Float64, lift height).
+            # Kept next to kinco_velocity so the lift's two dims read together.
+            "kinco_position",
+            # action only — /chassis_target_vel (Float32MultiArray).
+            # Components are taken to be vx / vy / yaw-rate; if that reading is
+            # wrong only these names need fixing, not the stored values.
+            "chassis_target_vel_x", "chassis_target_vel_y", "chassis_target_vel_yaw",
         ]
 
         # ACTION features
@@ -845,6 +859,19 @@ class MultiVideoRosBag2LeRobotConverter:
             msg.orientation.x, msg.orientation.y, msg.orientation.z, msg.orientation.w
         ], dtype=np.float32)
 
+    def extract_multiarray_data(self, msg, size: int):
+        """First `size` entries of a Float*MultiArray, zero-padded.
+
+        The publisher decides the array length; clamping and padding here keeps
+        a short or over-long message from shifting neighbouring dimensions.
+        """
+        values = list(msg.data) if msg.data is not None else []
+        out = np.zeros(size, dtype=np.float32)
+        n = min(len(values), size)
+        if n:
+            out[:n] = values[:n]
+        return out
+
     def _update_state_msg(self, topicName:str, msg:JointState):
         if   topicName == '/left_arm/joint_states':
             joint_data = self.extract_joint_data(msg)
@@ -885,6 +912,11 @@ class MultiVideoRosBag2LeRobotConverter:
         elif topicName == '/kinco/actual_velocity':
             self._cur_state_msg[71] = msg.data     # Float64
 
+        # --- Unpaired: lift height feedback, no action counterpart (index 72) ---
+        # Robots without a lift never publish this, so the dim stays 0.
+        elif topicName == '/kinco/actual_position':
+            self._cur_state_msg[72] = msg.data     # Float64
+
     def _update_action_msg(self, topicName:str, msg):
         if   topicName == '/left_arm/joint_cmd':
             joint_data = self.extract_joint_data(msg)
@@ -924,6 +956,10 @@ class MultiVideoRosBag2LeRobotConverter:
             self._cur_action_msg[62:71] = jd[0:9]  # pos[0:3], vel[3:6], eff[6:9]
         elif topicName == '/kinco/cmd_velocity':
             self._cur_action_msg[71] = msg.data    # Float64
+
+        # --- Unpaired: chassis velocity command, no state counterpart (73-75) ---
+        elif topicName == '/chassis_target_vel':
+            self._cur_action_msg[73:76] = self.extract_multiarray_data(msg, 3)
 
     def _update_video_frame(self, topicName:str, msg:FFMPEGPacket):
         camera_key = self.topic_to_camera.get(topicName)
