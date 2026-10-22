@@ -17,7 +17,9 @@ import os
 import shutil
 from pathlib import Path
 
-import pandas as pd
+import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 # Constants
 DEFAULT_CHUNK_SIZE = 1000
@@ -147,20 +149,34 @@ def rewrite_parquet(
     start_frame: int,
     chunk_size: int,
 ) -> None:
-    """Read old parquet, update indices and write to new location."""
+    """Read old parquet, update indices and write to new location.
+
+    Uses pyarrow directly (not pandas) so the original schema is kept as-is:
+    fixed_size_list columns stay fixed-size and the `huggingface` schema
+    metadata is preserved.
+    """
     source_path = find_parquet_path(dataset, old_index, chunk_size)
     if source_path is None:
         print(f"[Warning] Could not find parquet file for episode {old_index}, skipped.")
         return
 
-    df = pd.read_parquet(source_path)
-    if "episode_index" in df.columns:
-        df["episode_index"] = new_index
-    if "index" in df.columns:
-        df["index"] = [start_frame + i for i in range(len(df))]
+    source_file = pq.ParquetFile(source_path)
+    compression = source_file.metadata.row_group(0).column(0).compression if source_file.metadata.num_row_groups else "snappy"
+    table = source_file.read()
+    num_rows = table.num_rows
+    new_columns = {
+        "episode_index": np.full(num_rows, new_index, dtype=np.int64),
+        "index": np.arange(start_frame, start_frame + num_rows, dtype=np.int64),
+    }
+    for name, values in new_columns.items():
+        position = table.schema.get_field_index(name)
+        if position == -1:
+            continue
+        field = table.schema.field(position)
+        table = table.set_column(position, field, pa.array(values, type=field.type))
 
     destination_path = build_parquet_path(dataset, new_index, chunk_size)
-    df.to_parquet(destination_path, index=False)
+    pq.write_table(table, destination_path, compression=compression.lower())
 
     if destination_path != source_path and source_path.exists():
         source_path.unlink()
@@ -231,6 +247,27 @@ def compute_frame_starts(episodes: list[dict]) -> tuple[dict[int, int], int]:
         starts[episode["episode_index"]] = running
         running += episode.get("length", 0)
     return starts, running
+
+
+def index_feature_stats(values: np.ndarray) -> dict:
+    """Per-episode stats entry in the same format LeRobot writes to episodes_stats.jsonl."""
+    return {
+        "min": [int(values.min())],
+        "max": [int(values.max())],
+        "mean": [float(values.mean())],
+        "std": [float(values.std())],
+        "count": [len(values)],
+    }
+
+
+def update_index_stats(record: dict, new_index: int, start_frame: int, length: int) -> dict:
+    """Refresh the `index` / `episode_index` stats of a renumbered episode to match its rewritten parquet."""
+    stats = record.get("stats", {})
+    if "episode_index" in stats:
+        stats["episode_index"] = index_feature_stats(np.full(length, new_index, dtype=np.int64))
+    if "index" in stats:
+        stats["index"] = index_feature_stats(np.arange(start_frame, start_frame + length, dtype=np.int64))
+    return record
 
 
 def update_info(
@@ -306,6 +343,10 @@ def remove_episodes(dataset: Path, episode_indices: list[int]) -> None:
     # Save updated episodes.jsonl
     save_jsonl(new_episodes, episodes_path)
 
+    # Recalculate frame start indices
+    frame_starts, total_frames = compute_frame_starts(new_episodes)
+    lengths = {episode["episode_index"]: episode.get("length", 0) for episode in new_episodes}
+
     # Update episodes_stats.jsonl
     stats_records = load_jsonl(stats_path)
     if stats_records:
@@ -315,8 +356,13 @@ def remove_episodes(dataset: Path, episode_indices: list[int]) -> None:
             if idx in indices_to_remove:
                 continue  # Skip statistics for episodes to be deleted
             if idx in index_mapping:
-                record = record.copy()
-                record["episode_index"] = index_mapping[idx]
+                record = json.loads(json.dumps(record))  # deep copy
+                new_idx = index_mapping[idx]
+                record["episode_index"] = new_idx
+                # Renumbered episodes get their parquet `index`/`episode_index` rewritten below,
+                # so their stats must be refreshed as well
+                if new_idx != idx:
+                    update_index_stats(record, new_idx, frame_starts[new_idx], lengths[new_idx])
             new_stats.append(record)
         new_stats.sort(key=lambda x: x["episode_index"])
         save_jsonl(new_stats, stats_path)
@@ -324,9 +370,6 @@ def remove_episodes(dataset: Path, episode_indices: list[int]) -> None:
     # Delete all files corresponding to target episodes
     for target_index in indices_to_remove:
         remove_target_files(dataset, target_index, chunk_size, video_template, video_keys)
-
-    # Recalculate frame start indices
-    frame_starts, total_frames = compute_frame_starts(new_episodes)
 
     # Rewrite parquet / video files (those that need to be moved)
     for old_index, new_index in sorted(index_mapping.items()):
