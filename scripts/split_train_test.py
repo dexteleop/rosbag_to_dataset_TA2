@@ -24,9 +24,50 @@ import math
 import shutil
 from pathlib import Path
 
-import pandas as pd
+import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 DEFAULT_CHUNK_SIZE = 1000
+VECTOR_KEYS = ("action", "observation.state")
+
+
+def vector_columns(table: pa.Table) -> dict[str, np.ndarray]:
+    """Return {column: ndarray} for the vector-valued feature columns present in the table."""
+    return {
+        key: np.stack(table[key].to_numpy(zero_copy_only=False))
+        for key in VECTOR_KEYS
+        if key in table.column_names
+    }
+
+
+def stats_entry(values: np.ndarray) -> dict:
+    """Per-episode statistics in the format LeRobot writes to episodes_stats.jsonl."""
+    return {
+        "min": values.min(0).tolist(),
+        "max": values.max(0).tolist(),
+        "mean": values.mean(0).tolist(),
+        "std": values.std(0).tolist(),
+        "count": [int(values.shape[0])],
+    }
+
+
+def build_episode_stats(table: pa.Table) -> dict:
+    """Recompute statistics for every numeric feature of one episode.
+
+    Splitting renumbers episodes and restarts the global frame index, so the statistics
+    carried over from the source dataset no longer describe the split episode.
+    """
+    stats = {}
+    for key, values in vector_columns(table).items():
+        stats[key] = stats_entry(values.astype(np.float64))
+    for key in table.column_names:
+        if key in VECTOR_KEYS:
+            continue
+        values = table[key].to_numpy(zero_copy_only=False)
+        if values.dtype.kind in "iufb":
+            stats[key] = stats_entry(values.astype(np.float64).reshape(-1, 1))
+    return stats
 
 
 def load_jsonl(path: Path) -> list[dict]:
@@ -135,37 +176,46 @@ def copy_episode(
     data_template: str | None,
     video_template: str | None,
     video_keys: list[str],
-) -> None:
+) -> pa.Table:
+    """Copy one episode, renumbering it. Returns the rewritten table for statistics reuse."""
     src_parquet = find_source_parquet(src_dataset, old_index, chunk_size)
     if src_parquet is None:
         raise FileNotFoundError(f"Parquet not found for episode {old_index}")
 
-    df = pd.read_parquet(src_parquet)
-    if "episode_index" in df.columns:
-        df["episode_index"] = new_index
-    if "index" in df.columns:
-        df["index"] = [new_start_frame + i for i in range(len(df))]
+    table = pq.read_table(src_parquet)
+    num_rows = table.num_rows
+
+    position = table.schema.get_field_index("episode_index")
+    if position != -1:
+        field = table.schema.field(position)
+        table = table.set_column(position, field,
+                                 pa.array(np.full(num_rows, new_index, dtype=np.int64), type=field.type))
+    position = table.schema.get_field_index("index")
+    if position != -1:
+        field = table.schema.field(position)
+        table = table.set_column(position, field,
+                                 pa.array(np.arange(new_start_frame, new_start_frame + num_rows, dtype=np.int64),
+                                          type=field.type))
 
     dst_parquet = build_dest_parquet(dst_dataset, data_template, new_index, chunk_size)
-    df.to_parquet(dst_parquet, index=False)
+    pq.write_table(table, dst_parquet, compression="snappy")
 
-    if not (video_template and video_keys):
-        return
+    if video_template and video_keys:
+        for video_key in video_keys:
+            src_video = find_source_video(src_dataset, video_template, video_key, old_index, chunk_size)
+            if src_video is None:
+                print(f"[Warning] Video not found: {video_key}, episode {old_index}, skipped.")
+                continue
+            dst_video = build_dest_video(dst_dataset, video_template, video_key, new_index, chunk_size)
+            shutil.copy2(str(src_video), str(dst_video))
 
-    for video_key in video_keys:
-        src_video = find_source_video(src_dataset, video_template, video_key, old_index, chunk_size)
-        if src_video is None:
-            print(f"[Warning] Video not found: {video_key}, episode {old_index}, skipped.")
-            continue
-        dst_video = build_dest_video(dst_dataset, video_template, video_key, new_index, chunk_size)
-        shutil.copy2(str(src_video), str(dst_video))
+    return table
 
 
 def write_split(
     src_dataset: Path,
     dst_dataset: Path,
     split_episodes: list[dict],
-    src_stats_map: dict[int, dict],
     info: dict,
     chunk_size: int,
     data_template: str | None,
@@ -183,7 +233,7 @@ def write_split(
         ep_copy["episode_index"] = new_index
         new_episodes.append(ep_copy)
 
-        copy_episode(
+        table = copy_episode(
             src_dataset,
             dst_dataset,
             old_index,
@@ -195,10 +245,9 @@ def write_split(
             video_keys,
         )
 
-        if old_index in src_stats_map:
-            stat = src_stats_map[old_index].copy()
-            stat["episode_index"] = new_index
-            new_stats.append(stat)
+        # Statistics are recomputed: episode_index and index are rewritten by the split,
+        # so the statistics recorded in the source dataset no longer describe this episode.
+        new_stats.append({"episode_index": new_index, "stats": build_episode_stats(table)})
 
         cum_frames += episode.get("length", 0)
 
@@ -250,9 +299,6 @@ def split_dataset(dataset_path: Path, num_train_episodes: int) -> None:
         raise RuntimeError("episodes.jsonl is empty or does not exist.")
     episodes = sorted(episodes, key=lambda x: x["episode_index"])
 
-    stats_records = load_jsonl(meta_dir / "episodes_stats.jsonl")
-    src_stats_map = {r["episode_index"]: r for r in stats_records if "episode_index" in r}
-
     total = len(episodes)
     train_dst = dataset.parent / f"{dataset.name}_train"
     test_dst = dataset.parent / f"{dataset.name}_test"
@@ -277,7 +323,7 @@ def split_dataset(dataset_path: Path, num_train_episodes: int) -> None:
 
     train_dst.mkdir(parents=True)
     n_tr, f_tr = write_split(
-        dataset, train_dst, train_eps, src_stats_map, info,
+        dataset, train_dst, train_eps, info,
         chunk_size, data_template, video_template, video_keys, "train",
     )
     print(f"[Complete] Train: {n_tr} episodes, {f_tr} frames -> {train_dst}")
@@ -285,7 +331,7 @@ def split_dataset(dataset_path: Path, num_train_episodes: int) -> None:
     if test_eps:
         test_dst.mkdir(parents=True)
         n_te, f_te = write_split(
-            dataset, test_dst, test_eps, src_stats_map, info,
+            dataset, test_dst, test_eps, info,
             chunk_size, data_template, video_template, video_keys, "test",
         )
         print(f"[Complete] Test:  {n_te} episodes, {f_te} frames -> {test_dst}")

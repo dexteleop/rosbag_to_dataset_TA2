@@ -20,11 +20,15 @@ import json
 import os
 import shutil
 import traceback
-import pandas as pd
+
+import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
 from pathlib import Path
 
 # Constants
 DEFAULT_CHUNK_SIZE = 1000
+VECTOR_KEYS = ("action", "observation.state")
 
 def load_jsonl(file_path):
     """Load data from a JSONL file
@@ -148,6 +152,45 @@ def copy_videos(source_folders, output_folder, episode_mapping, chunks_size=DEFA
                       f"the merged dataset will be missing this video")
 
 
+def vector_columns(table):
+    """Return {column: ndarray} for the vector-valued feature columns present in the table."""
+    out = {}
+    for key in VECTOR_KEYS:
+        if key in table.column_names:
+            out[key] = np.stack(table[key].to_numpy(zero_copy_only=False))
+    return out
+
+
+def stats_entry(values):
+    """Per-episode statistics in the format LeRobot writes to episodes_stats.jsonl."""
+    return {
+        "min": values.min(0).tolist(),
+        "max": values.max(0).tolist(),
+        "mean": values.mean(0).tolist(),
+        "std": values.std(0).tolist(),
+        "count": [int(values.shape[0])],
+    }
+
+
+def build_episode_stats(table):
+    """Recompute statistics for every numeric feature of one episode.
+
+    Renumbering rewrites episode_index and index, and merging can remap task_index, so the
+    source statistics of those columns cannot be reused. Vector columns are recomputed from
+    the merged data; scalar columns are recomputed the same way.
+    """
+    stats = {}
+    for key, values in vector_columns(table).items():
+        stats[key] = stats_entry(values.astype(np.float64))
+    for key in table.column_names:
+        if key in VECTOR_KEYS:
+            continue
+        values = table[key].to_numpy(zero_copy_only=False)
+        if values.dtype.kind in "iufb":
+            stats[key] = stats_entry(values.astype(np.float64).reshape(-1, 1))
+    return stats
+
+
 def copy_data_files(
     source_folders,
     output_folder,
@@ -171,6 +214,7 @@ def copy_data_files(
         info = json.load(f)
 
     data_path_template = info["data_path"]
+    episode_stats = {}
 
     for old_folder, old_index, new_index in episode_mapping:
         episode_chunk = old_index // chunks_size
@@ -180,29 +224,39 @@ def copy_data_files(
         )
 
         try:
-            df = pd.read_parquet(source_path)
+            table = pq.read_table(source_path)
+            num_rows = table.num_rows
 
-            if "episode_index" in df.columns:
-                print(f"Update episode_index from {df['episode_index'].iloc[0]} to {new_index}")
-                df["episode_index"] = new_index
+            position = table.schema.get_field_index("episode_index")
+            if position != -1:
+                print(f"Update episode_index from {table['episode_index'][0].as_py()} to {new_index}")
+                table = table.set_column(position, table.schema.field(position),
+                                         pa.array(np.full(num_rows, new_index, dtype=np.int64),
+                                                  type=table.schema.field(position).type))
 
-            if "index" in df.columns:
+            position = table.schema.get_field_index("index")
+            if position != -1:
                 if episode_to_frame_index and new_index in episode_to_frame_index:
                     first_index = episode_to_frame_index[new_index]
                     print(f"Update index column, start value: {first_index} (using global cumulative frame count)")
                 else:
-                    first_index = new_index * len(df)
+                    first_index = new_index * num_rows
                     print(f"Update index column, start value: {first_index} (using episode index multiplied by length)")
 
-                df["index"] = [first_index + i for i in range(len(df))]
+                table = table.set_column(position, table.schema.field(position),
+                                         pa.array(np.arange(first_index, first_index + num_rows, dtype=np.int64),
+                                                  type=table.schema.field(position).type))
 
-            if "task_index" in df.columns and folder_task_mapping and old_folder in folder_task_mapping:
-                current_task_index = df["task_index"].iloc[0]
+            position = table.schema.get_field_index("task_index")
+            if position != -1 and folder_task_mapping and old_folder in folder_task_mapping:
+                current_task_index = table["task_index"][0].as_py()
 
                 if current_task_index in folder_task_mapping[old_folder]:
                     new_task_index = folder_task_mapping[old_folder][current_task_index]
                     print(f"Update task_index from {current_task_index} to {new_task_index}")
-                    df["task_index"] = new_task_index
+                    table = table.set_column(position, table.schema.field(position),
+                                             pa.array(np.full(num_rows, new_task_index, dtype=np.int64),
+                                                      type=table.schema.field(position).type))
                 else:
                     print(f"Warning: No mapping found for task_index {current_task_index}")
 
@@ -212,13 +266,16 @@ def copy_data_files(
             os.makedirs(chunk_dir, exist_ok=True)
             dest_path = os.path.join(chunk_dir, f"episode_{new_index:06d}.parquet")
 
-            df.to_parquet(dest_path, index=False)
+            pq.write_table(table, dest_path, compression="snappy")
+            episode_stats[new_index] = build_episode_stats(table)
             print(f"Processed and saved: {dest_path}")
 
         except Exception as e:
             error_msg = f"Processing {source_path} failed: {e}"
             print(error_msg)
             traceback.print_exc()
+
+    return episode_stats
 
 
 def merge_datasets(source_folders, output_folder):
@@ -232,7 +289,6 @@ def merge_datasets(source_folders, output_folder):
     os.makedirs(os.path.join(output_folder, "meta"), exist_ok=True)
 
     all_episodes = []
-    all_episodes_stats = []
     all_tasks = []
     all_unique_tasks = []
 
@@ -243,7 +299,6 @@ def merge_datasets(source_folders, output_folder):
     chunks_size = DEFAULT_CHUNK_SIZE
 
     episode_mapping = []
-    all_stats_data = []
     folder_dimensions = {}
 
     cumulative_frame_count = 0
@@ -274,16 +329,6 @@ def merge_datasets(source_folders, output_folder):
                 continue
             episodes = load_jsonl(episodes_path)
 
-            episodes_stats_path = os.path.join(folder, "meta", "episodes_stats.jsonl")
-            episodes_stats = []
-            if os.path.exists(episodes_stats_path):
-                episodes_stats = load_jsonl(episodes_stats_path)
-
-            stats_map = {}
-            for stat in episodes_stats:
-                if "episode_index" in stat:
-                    stats_map[stat["episode_index"]] = stat
-
             tasks_path = os.path.join(folder, "meta", "tasks.jsonl")
             folder_tasks = []
             if os.path.exists(tasks_path):
@@ -309,15 +354,6 @@ def merge_datasets(source_folders, output_folder):
                 episode["episode_index"] = new_index
                 all_episodes.append(episode)
 
-                if old_index in stats_map:
-                    stats = stats_map[old_index]
-                    stats["episode_index"] = new_index
-
-                    all_episodes_stats.append(stats)
-
-                    if "stats" in stats:
-                        all_stats_data.append(stats["stats"])
-
                 episode_mapping.append((folder, old_index, new_index))
 
                 total_episodes += 1
@@ -335,7 +371,6 @@ def merge_datasets(source_folders, output_folder):
     print(f"Processed {total_episodes} episodes from {len(source_folders)} folders")
 
     save_jsonl(all_episodes, os.path.join(output_folder, "meta", "episodes.jsonl"))
-    save_jsonl(all_episodes_stats, os.path.join(output_folder, "meta", "episodes_stats.jsonl"))
     save_jsonl(all_tasks, os.path.join(output_folder, "meta", "tasks.jsonl"))
 
     info_path = os.path.join(source_folders[0], "meta", "info.json")
@@ -361,7 +396,7 @@ def merge_datasets(source_folders, output_folder):
         episode_mapping,
         chunks_size,
     )
-    copy_data_files(
+    episode_stats = copy_data_files(
         source_folders,
         output_folder,
         episode_mapping,
@@ -369,6 +404,14 @@ def merge_datasets(source_folders, output_folder):
         folder_task_mapping,
         chunks_size,
     )
+
+    # Statistics are recomputed from the merged parquet files, because episode_index, index
+    # and task_index are all rewritten during the merge and the source stats no longer apply.
+    missing = [ep for ep in range(total_episodes) if ep not in episode_stats]
+    if missing:
+        print(f"Warning: no statistics computed for {len(missing)} episode(s): {missing[:10]}")
+    merged_stats = [{"episode_index": ep, "stats": episode_stats[ep]} for ep in sorted(episode_stats)]
+    save_jsonl(merged_stats, os.path.join(output_folder, "meta", "episodes_stats.jsonl"))
 
     print(f"Merged {total_episodes} episodes with {total_frames} frames into {output_folder}")
 
