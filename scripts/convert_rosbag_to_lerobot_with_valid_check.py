@@ -447,6 +447,14 @@ class ReviewedConverter(base.MultiVideoRosBag2LeRobotConverter):
 
     # ---- report --------------------------------------------------------
     def write_report(self):
+        """Write the report, or return None when there is nowhere to put it.
+
+        The base script returns before creating the dataset when it finds no
+        bags; with no --review-report path there is then no dataset root to
+        write into, and the base script has already logged why.
+        """
+        if self.report_path is None and self.dataset is None:
+            return None
         path = self.report_path or (Path(self.dataset.root) / 'review_report.json')
         checks = []
         for bag in self.report_bags:
@@ -481,10 +489,10 @@ class ReviewedConverter(base.MultiVideoRosBag2LeRobotConverter):
 
         report = {
             'schema_version': 1,
-            'dataset_root': str(self.dataset.root),
+            'dataset_root': str(self.dataset.root) if self.dataset else None,
             'review_enabled': self.reviews is not None,
             'review_files': self.reviews.files if self.reviews else [],
-            'episode_count': int(self.dataset.num_episodes),
+            'episode_count': int(self.dataset.num_episodes) if self.dataset else 0,
             'checks': checks,
             'bags': self.report_bags,
         }
@@ -500,7 +508,8 @@ class ReviewedConverter(base.MultiVideoRosBag2LeRobotConverter):
             return super().convert_all(*args, **kwargs)
         finally:
             report_path = self.write_report()
-            self.logger.info(f'Review report: {report_path}')
+            if report_path is not None:
+                self.logger.info(f'Review report: {report_path}')
 
 
 def parse_args(argv):
