@@ -66,7 +66,8 @@ Options added on top of the base script
                                  required when checking
     --review-report PATH         JSON report (default <dataset>/review_report.json)
 
-Every other option is the base script's and is passed through unchanged:
+Every other option is the base script's and is passed through unchanged,
+e.g. --head_resolution 1920x960:
 
     python scripts/convert_rosbag_to_lerobot_with_valid_check.py --help
 """
@@ -332,8 +333,8 @@ class ReviewedConverter(base.MultiVideoRosBag2LeRobotConverter):
     """
 
     def __init__(self, input_directory, output_repo_id, fps=45, crf=23,
-                 reviews=None, report_path=None):
-        super().__init__(input_directory, output_repo_id, fps=fps, crf=crf)
+                 reviews=None, report_path=None, **base_options):
+        super().__init__(input_directory, output_repo_id, fps=fps, crf=crf, **base_options)
         self.reviews = reviews
         self.report_path = Path(report_path) if report_path else None
         self.report_bags = []
@@ -558,9 +559,10 @@ def _run(argv, reviews, report_path):
     base.MultiVideoRosBag2LeRobotConverter = ReviewedConverter
     original_init = ReviewedConverter.__init__
 
-    def converter_init(self, input_directory, output_repo_id, fps=45, crf=23):
+    def converter_init(self, input_directory, output_repo_id, fps=45, crf=23, **base_options):
+        # base_options: whatever else the base script passes (e.g. output_sizes)
         original_init(self, input_directory, output_repo_id, fps=fps, crf=crf,
-                      reviews=reviews, report_path=report_path)
+                      reviews=reviews, report_path=report_path, **base_options)
     ReviewedConverter.__init__ = converter_init
     # The base script parses sys.argv itself, and our options are not its
     # options, so only the arguments it understands are shown to it.
