@@ -1879,6 +1879,7 @@ def main():
                 sys.exit(1)
             converter = MultiVideoRosBag2LeRobotConverter(args.input_directory, args.output, args.fps,
                                                           crf=args.crf, output_sizes=output_sizes)
+            converter.max_episodes = args.max_episodes
             ok = converter.convert_all(args.task, args.multibag, args.enforce_all_video_topics, args.whole_bag)
         finally:
             sys.stdout.flush()
