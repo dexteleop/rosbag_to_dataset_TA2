@@ -457,14 +457,18 @@ class AllIdrVideoBuffer:
         )
         # Resizing happens after resampling, on the GPU when the GPU path
         # runs (decoded frames never leave it) and in software otherwise.
-        # Lanczos for both, so the two paths give the same picture.
+        # Not lanczos/bicubic on the GPU: scale_cuda does not clamp their
+        # overshoot, so near-black pixels wrap to white (salt noise in dark
+        # areas). Bilinear on the GPU and area in software both average each
+        # 2x2 block for the 3840x1920 -> 1920x960 case, so the two paths
+        # give the same picture.
         size = self.output_sizes.get(camera_name)
         gpu_vf = resample_vf
         cpu_vf = resample_vf
         if size is not None:
             width, height = size
-            gpu_vf += f",scale_cuda={width}:{height}:interp_algo=lanczos"
-            cpu_vf += f",scale={width}:{height}:flags=lanczos"
+            gpu_vf += f",scale_cuda={width}:{height}:interp_algo=bilinear"
+            cpu_vf += f",scale={width}:{height}:flags=area"
         # With dropped ticks the encode must cover the full tick span so
         # _finalize_video can pick each row's own slot from the grid.
         grid_span = (tick_indices[-1] + 1) if tick_indices else episode_length
