@@ -86,6 +86,7 @@ Usage:
       --verbose           print progress to terminal instead of a log file
 """
 
+import errno
 import os
 import re
 import sys
@@ -219,6 +220,34 @@ def normalize_codec_name(codec: str) -> str:
     return codec
 
 
+# Bytes of /dev/shm promised to .ts files still being written. The cameras
+# are muxed in parallel, and each must count the others' unwritten bytes.
+_shm_lock = threading.Lock()
+_shm_reserved = 0
+SHM_HEADROOM = 256 * 2**20
+
+
+def _reserve_shm(nbytes: int) -> int:
+    """Reserve nbytes of /dev/shm; returns what was reserved, 0 = use disk."""
+    global _shm_reserved
+    with _shm_lock:
+        try:
+            st = os.statvfs("/dev/shm")
+        except OSError:
+            return 0
+        free = st.f_bavail * st.f_frsize - _shm_reserved
+        if nbytes * 1.05 + SHM_HEADROOM > free:
+            return 0
+        _shm_reserved += nbytes
+        return nbytes
+
+
+def _release_shm(nbytes: int) -> None:
+    global _shm_reserved
+    with _shm_lock:
+        _shm_reserved -= nbytes
+
+
 class AllIdrVideoBuffer:
     """
     Buffers pre-encoded video packets (plus their bag timestamps) and re-encodes
@@ -303,12 +332,38 @@ class AllIdrVideoBuffer:
         })
 
     def _mux_to_ts(self, packet_list, info) -> str:
-        """Mux raw annex-B packets into a temp MPEG-TS with PTS from bag timestamps."""
-        # Prefer RAM-backed /dev/shm: the .ts is a pure intermediate that
-        # ffmpeg reads back immediately, no reason to round-trip the disk
-        tmp_dir = "/dev/shm" if os.path.isdir("/dev/shm") else None
+        """Mux raw annex-B packets into a temp MPEG-TS with PTS from bag timestamps.
+
+        Prefers RAM-backed /dev/shm: the .ts is a pure intermediate that
+        ffmpeg reads back immediately, no reason to round-trip the disk. A
+        long episode (whole-bag mode: an hour of video is several GB per
+        camera) goes to the regular temp dir when /dev/shm can't hold it --
+        or when writing there fails anyway."""
+        need = sum(len(p['data']) for p in packet_list)
+        shm = _reserve_shm(need)
+        try:
+            return self._write_ts(packet_list, info, "/dev/shm" if shm else None)
+        except OSError as e:
+            if not shm or e.errno not in (errno.ENOSPC, errno.EDQUOT):
+                raise
+            logging.getLogger(__name__).warning(
+                f"  ⚠️ /dev/shm full while writing {need / 2**30:.1f} GiB of video, "
+                f"retrying in {tempfile.gettempdir()}")
+        finally:
+            _release_shm(shm)
+        return self._write_ts(packet_list, info, None)
+
+    def _write_ts(self, packet_list, info, tmp_dir) -> str:
         fd, ts_path = tempfile.mkstemp(suffix=".ts", prefix="lerobot_ep_", dir=tmp_dir)
         os.close(fd)
+        try:
+            self._mux_packets(packet_list, info, ts_path)
+        except BaseException:
+            os.unlink(ts_path)  # a tmpfs file outlives the process: never leave one behind
+            raise
+        return ts_path
+
+    def _mux_packets(self, packet_list, info, ts_path) -> None:
         container = av.open(ts_path, "w", format="mpegts")
         stream = container.add_stream(info['codec'])
         stream.width = info['width']
@@ -342,7 +397,6 @@ class AllIdrVideoBuffer:
         sentinel.stream = stream
         container.mux(sentinel)
         container.close()
-        return ts_path
 
     def encode_episode(
         self, episode_index: int, dataset_meta,
