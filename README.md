@@ -146,6 +146,8 @@ python scripts/convert_rosbag_to_lerobot.py \
 - `--multibag`: (Optional) Use if the directory contains multiple rosbag folders
 - `--enforce_all_video_topics`: (Optional) Skip bags missing any of the three video topics
 - `--whole_bag`: (Optional) Treat each entire bag as one continuous episode (no X/Y markers needed)
+- `--head_resolution`: (Optional) Size of the head camera video, `WIDTHxHEIGHT` (default: `1920x960`, half the 3840x1920 source); `source` keeps the source size
+- `--wrist_resolution`: (Optional) Size of both wrist camera videos (`left_color`, `right_color`), e.g. `1280x400` (default: source size, 2560x800)
 - `--crf`: (Optional) Encoder quality — constant QP on GPU / CRF on CPU; lower = better quality, larger files (default: 23)
 - `--nvenc_sessions`: (Optional) Max concurrent GPU encode sessions (default: 7). Consumer NVIDIA drivers cap NVENC sessions system-wide; lower this to 5 or 3 if GPU encodes fail on drivers older than 550/522
 - `--max_episodes`: (Optional) Stop after N episodes — handy for a quick test run

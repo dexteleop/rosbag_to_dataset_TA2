@@ -75,6 +75,12 @@ Usage:
     ```
 
     Useful options:
+      --head_resolution WxH
+                          size of the head camera video (default 1920x960,
+                          half the 3840x1920 source); "source" keeps it
+      --wrist_resolution WxH
+                          size of both wrist camera videos (default: source
+                          size, 2560x800), e.g. 1280x400
       --crf N             encoder quality (constant QP on GPU / CRF on CPU,
                           lower = better quality, default 23)
       --nvenc_sessions N  max concurrent GPU encode sessions (default 7;
@@ -84,6 +90,7 @@ Usage:
 """
 
 import os
+import re
 import sys
 import time
 import threading
@@ -242,7 +249,8 @@ class AllIdrVideoBuffer:
         ```
     """
 
-    def __init__(self, root_dir: Path, fps: int, crf: int = 23, preset: str = "ultrafast"):
+    def __init__(self, root_dir: Path, fps: int, crf: int = 23, preset: str = "ultrafast",
+                 output_sizes: dict = None):
         """
         Initialize all-IDR video buffer.
 
@@ -251,11 +259,14 @@ class AllIdrVideoBuffer:
             fps: Frames per second for video
             crf: Quantizer for hevc_nvenc (-qp) / CRF for the libx265 CPU fallback
             preset: libx265 preset for the CPU fallback (GPU path always uses p1)
+            output_sizes: {camera_name: (width, height)} for cameras to resize
+                while encoding; other cameras keep their source size
         """
         self.root_dir = Path(root_dir)
         self.fps = fps
         self.crf = crf
         self.preset = preset
+        self.output_sizes = dict(output_sizes or {})
 
         # Buffer: {camera_name: [packet_dict, ...]}
         self.packets = defaultdict(list)
@@ -447,6 +458,20 @@ class AllIdrVideoBuffer:
             f"fps={self.fps}:start_time={grid_start:.6f}:round=up,"
             f"setpts=PTS-STARTPTS"
         )
+        # Resizing happens after resampling, on the GPU when the GPU path
+        # runs (decoded frames never leave it) and in software otherwise.
+        # Not lanczos/bicubic on the GPU: scale_cuda does not clamp their
+        # overshoot, so near-black pixels wrap to white (salt noise in dark
+        # areas). Bilinear on the GPU and area in software both average each
+        # 2x2 block for the 3840x1920 -> 1920x960 case, so the two paths
+        # give the same picture.
+        size = self.output_sizes.get(camera_name)
+        gpu_vf = resample_vf
+        cpu_vf = resample_vf
+        if size is not None:
+            width, height = size
+            gpu_vf += f",scale_cuda={width}:{height}:interp_algo=bilinear"
+            cpu_vf += f",scale={width}:{height}:flags=area"
         # With dropped ticks the encode must cover the full tick span so
         # _finalize_video can pick each row's own slot from the grid.
         grid_span = (tick_indices[-1] + 1) if tick_indices else episode_length
@@ -458,7 +483,7 @@ class AllIdrVideoBuffer:
             "-hwaccel_output_format", "cuda",   # keep decoded frames on the GPU
             "-c:v", "hevc_cuvid",
             "-i", ts_path,
-            "-vf", resample_vf,
+            "-vf", gpu_vf,
             # Ask for one extra frame: ffmpeg 7.x + NVENC can drop the frame
             # that hits the -frames:v cap during teardown, so the capped
             # frame must be a sacrificial one past the episode's last tick.
@@ -487,7 +512,7 @@ class AllIdrVideoBuffer:
                     f"  GPU pipeline failed for {camera_name} ({gpu_err}), "
                     f"falling back to CPU..."
                 )
-                self._encode_cpu(ts_path, tmp_path, resample_vf, grid_span)
+                self._encode_cpu(ts_path, tmp_path, cpu_vf, grid_span)
         finally:
             if os.path.exists(ts_path):
                 os.unlink(ts_path)
@@ -592,8 +617,11 @@ class AllIdrVideoBuffer:
 class MultiVideoRosBag2LeRobotConverter:
     """Enhanced converter for multiple ROS2 bags to single LeRobot dataset with multiple episodes."""
 
-    def __init__(self, input_directory: str, output_repo_id: str, fps: int = 45, crf: int = 23):
+    def __init__(self, input_directory: str, output_repo_id: str, fps: int = 45, crf: int = 23,
+                 output_sizes: dict = None):
         self.input_directory = Path(input_directory)
+        # {camera_key: (width, height)} for cameras resized while encoding
+        self.output_sizes = dict(output_sizes or {})
         self.output_repo_id = output_repo_id
         self.fps = fps
         self.crf = crf
@@ -740,7 +768,14 @@ class MultiVideoRosBag2LeRobotConverter:
         return rosbags
 
     def get_camera_resolution(self, camera_key):
-        """Get camera resolution - different cameras may have different resolutions."""
+        """(height, width, channels) of the camera's output video.
+
+        This is the size written into the dataset features and used for the
+        stats sampler, so it is the resized size when the camera is resized.
+        """
+        if camera_key in self.output_sizes:
+            width, height = self.output_sizes[camera_key]
+            return (height, width, 3)
         if camera_key == 'head_camera':
             # Head camera is higher resolution
             return (1920, 3840, 3)
@@ -1047,7 +1082,8 @@ class MultiVideoRosBag2LeRobotConverter:
         self.dataset.episode_buffer = self.dataset.create_episode_buffer()
         self._episode_ticks = []
         packet_buffer = AllIdrVideoBuffer(
-            root_dir=self.dataset.root, fps=self.dataset.fps, crf=self.crf
+            root_dir=self.dataset.root, fps=self.dataset.fps, crf=self.crf,
+            output_sizes=self.output_sizes,
         )
         _t = time.perf_counter()
         for ck in self.video_topics.keys():
@@ -1319,7 +1355,8 @@ class MultiVideoRosBag2LeRobotConverter:
             self.logger.info("⏳ Waiting for first IDR frame from all cameras...")
 
             frame_data = dict()
-            packet_buffer = AllIdrVideoBuffer(root_dir=self.dataset.root, fps=self.dataset.fps, crf=self.crf)
+            packet_buffer = AllIdrVideoBuffer(root_dir=self.dataset.root, fps=self.dataset.fps,
+                                              crf=self.crf, output_sizes=self.output_sizes)
             self.dataset.episode_buffer = self.dataset.create_episode_buffer()
 
             episode_state_target_t = None
@@ -1760,6 +1797,20 @@ def setup_logging_to_file(log_file_path):
     return log_file
 
 
+def parse_size(value):
+    """'1920x960' -> (1920, 960); 'source' -> None (keep the source size).
+    Both sides even, as yuv420 requires."""
+    if value.strip().lower() in ("source", "original"):
+        return None
+    match = re.fullmatch(r"(\d+)[xX*](\d+)", value.strip())
+    if not match:
+        raise argparse.ArgumentTypeError(f"expected WIDTHxHEIGHT, e.g. 1920x960, got {value!r}")
+    width, height = int(match[1]), int(match[2])
+    if width <= 0 or height <= 0 or width % 2 or height % 2:
+        raise argparse.ArgumentTypeError(f"{value}: width and height must be positive even numbers")
+    return width, height
+
+
 def main():
     parser = argparse.ArgumentParser(description="Convert multiple ROS2 bags to LeRobot dataset with all-IDR video re-encoding")
     parser.add_argument("--multibag",
@@ -1783,6 +1834,12 @@ def main():
     parser.add_argument("--whole_bag",
                         action="store_true",
                         help="Treat the entire rosbag as one continuous episode (no X/Y markers needed)")
+    parser.add_argument("--head_resolution", type=parse_size, default=(1920, 960), metavar="WIDTHxHEIGHT",
+                        help="Size of the head camera video (default: 1920x960, half the "
+                             "3840x1920 source); 'source' keeps the source size")
+    parser.add_argument("--wrist_resolution", type=parse_size, default=None, metavar="WIDTHxHEIGHT",
+                        help="Size of both wrist camera videos (left_color, right_color), e.g. "
+                             "1280x400 (default: keep the source size, 2560x800)")
     parser.add_argument("--crf", type=int,
                         default=23,
                         help="CRF quality for libx265 re-encoding (lower=better quality, default: 23)")
@@ -1800,6 +1857,9 @@ def main():
 
     global _NVENC_SESSIONS
     _NVENC_SESSIONS = threading.BoundedSemaphore(args.nvenc_sessions)
+    output_sizes = {'head_camera': args.head_resolution,
+                    'left_color': args.wrist_resolution, 'right_color': args.wrist_resolution}
+    output_sizes = {camera: size for camera, size in output_sizes.items() if size}
 
     if args.verbose:
         # Terminal mode: normal logging to stdout
@@ -1810,7 +1870,8 @@ def main():
         if not os.path.exists(args.input_directory):
             print(f"Error: Input directory {args.input_directory} not found!")
             sys.exit(1)
-        converter = MultiVideoRosBag2LeRobotConverter(args.input_directory, args.output, args.fps, crf=args.crf)
+        converter = MultiVideoRosBag2LeRobotConverter(args.input_directory, args.output, args.fps,
+                                                      crf=args.crf, output_sizes=output_sizes)
         converter.max_episodes = args.max_episodes
         if not converter.convert_all(args.task, args.multibag, args.enforce_all_video_topics, args.whole_bag):
             sys.exit(1)
@@ -1831,7 +1892,8 @@ def main():
             if not os.path.exists(args.input_directory):
                 print(f"Error: Input directory {args.input_directory} not found!")
                 sys.exit(1)
-            converter = MultiVideoRosBag2LeRobotConverter(args.input_directory, args.output, args.fps, crf=args.crf)
+            converter = MultiVideoRosBag2LeRobotConverter(args.input_directory, args.output, args.fps,
+                                                          crf=args.crf, output_sizes=output_sizes)
             ok = converter.convert_all(args.task, args.multibag, args.enforce_all_video_topics, args.whole_bag)
         finally:
             sys.stdout.flush()
