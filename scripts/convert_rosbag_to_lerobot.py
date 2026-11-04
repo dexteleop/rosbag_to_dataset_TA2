@@ -542,6 +542,9 @@ class AllIdrVideoBuffer:
                       options={"video_track_timescale": "90000"})
         in_stream = src.streams.video[0]
         out_stream = dst.add_stream_from_template(in_stream)
+        if in_stream.codec_context.name == 'hevc':
+            # A remux, but PyAV opens libx265 for this stream too (see _mux_to_ts)
+            out_stream.codec_context.options = {'x265-params': 'log-level=none'}
         tb = Fraction(1, 90000)
         step = int(round(90000 / self.fps))
         grid_pos = 0
