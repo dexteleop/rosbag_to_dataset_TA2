@@ -12,9 +12,10 @@ operator button presses (X button to start, Y button to end recording).
 The robot's camera streams are H.265 with inter-coded GOPs, so every episode
 is re-encoded such that EVERY output frame is an IDR keyframe (GOP=1 — any
 frame can be decoded independently, which training dataloaders rely on for
-random access). The pipeline runs fully on the GPU when an NVIDIA card is
-available (NVDEC decode → NVENC encode, frames never leave GPU memory) and
-falls back to libx265 on CPU otherwise:
+random access). The pipeline stays on the GPU when one is available:
+NVIDIA (NVDEC → NVENC, CUDA frames) or Intel/AMD (VA-API decode → encode,
+frames stay in GPU surfaces). With neither it falls back to libx265 on CPU.
+The backend is auto-detected (override with R2L_VIDEO_BACKEND=nvidia|vaapi|cpu):
 
   1. Raw camera packets are muxed into a temporary MPEG-TS carrying their
      real bag timestamps, preserving true camera timing across dropped frames.
@@ -83,8 +84,10 @@ Usage:
                           size, 2560x800), e.g. 1280x400
       --crf N             encoder quality (constant QP on GPU / CRF on CPU,
                           lower = better quality, default 23)
-      --nvenc_sessions N  max concurrent GPU encode sessions (default 7;
-                          lower to 5 or 3 on NVIDIA drivers older than 550/522)
+      --nvenc_sessions N  max concurrent NVENC sessions (default 7; lower to 5
+                          or 3 on NVIDIA drivers older than 550/522)
+      --vaapi_sessions N  max concurrent VA-API sessions per render node
+                          (default 4; increase only if the GPU is not saturated)
       --max_episodes N    stop after N episodes (for quick testing)
       --verbose           print progress to terminal instead of a log file
 """
@@ -92,6 +95,7 @@ Usage:
 import os
 import re
 import sys
+import glob
 import time
 import threading
 import numpy as np
@@ -201,11 +205,89 @@ def _detect_gpu_count() -> int:
         return 0
 
 
+def _vaapi_hevc_encode_available(device: str) -> bool:
+    """True if libva opens `device` and the driver exposes HEVC encoding.
+
+    The container ships libva + intel-media-driver, so the driver never has to
+    match host packages; only the kernel render node is borrowed from the host.
+    A machine with an Intel iGPU but a missing/incompatible driver fails here
+    and falls back to CPU instead of failing every episode's GPU attempt.
+    """
+    try:
+        result = subprocess.run(
+            ["vainfo", "--display", "drm", "--device", device],
+            capture_output=True, text=True, timeout=20,
+        )
+        if result.returncode != 0:
+            return False
+        return any(
+            "VAProfileHEVCMain" in line and "VAEntrypointEncSlice" in line
+            for line in result.stdout.splitlines()
+        )
+    except Exception:
+        return False
+
+
+def _detect_video_backend():
+    """Pick the fastest available video pipeline.
+
+    Returns (backend, devices):
+
+      ("nvidia", [0, 1, ...])   NVENC/NVDEC; ffmpeg CUDA device indices
+      ("vaapi", ["/dev/dri/renderD128", ...])   VA-API render nodes
+      ("cpu", [])               libx265 fallback
+
+    NVIDIA wins when both are present. Set R2L_VIDEO_BACKEND=nvidia|vaapi|cpu
+    to force a backend.
+    """
+    forced = os.environ.get("R2L_VIDEO_BACKEND", "").strip().lower()
+    if forced and forced not in ("nvidia", "vaapi", "cpu"):
+        logging.warning(f"Unknown R2L_VIDEO_BACKEND={forced!r}; auto-detecting")
+        forced = ""
+
+    if forced in ("", "nvidia"):
+        nvidia = _detect_gpu_count()
+        if nvidia > 0:
+            return "nvidia", list(range(nvidia))
+        if forced == "nvidia":
+            logging.warning("R2L_VIDEO_BACKEND=nvidia but no NVIDIA GPU is visible")
+
+    if forced in ("", "vaapi"):
+        nodes = sorted(glob.glob("/dev/dri/renderD*"))
+        usable = [node for node in nodes if _vaapi_hevc_encode_available(node)]
+        if usable:
+            return "vaapi", usable
+        if forced == "vaapi":
+            logging.warning(
+                "R2L_VIDEO_BACKEND=vaapi but no VA-API HEVC encoder is available "
+                f"(render nodes: {nodes or 'none'})"
+            )
+
+    return "cpu", []
+
+
+# Resolved once at startup; _get_video_backend() lazy-initialises for library
+# use. The session semaphore gates ffmpeg encode processes so an
+# over-subscribed GPU queues instead of failing over to the slow CPU path.
 # Consumer NVIDIA drivers cap concurrent NVENC sessions system-wide (8 on
-# driver >=550, 5 on 522-549, 3 before that). Gate ffmpeg GPU-encode
-# processes so an over-subscribed episode pipeline queues instead of failing
-# over to the slow CPU path. Tune with --nvenc_sessions on older drivers.
-_NVENC_SESSIONS = threading.BoundedSemaphore(7)
+# driver >=550, 5 on 522-549, 3 before that); tune with --nvenc_sessions.
+_VIDEO_BACKEND = None
+_VIDEO_DEVICES = []
+_ENCODE_SESSIONS = threading.BoundedSemaphore(7)
+
+# Intel's CQP at qp N lands close to NVENC at qp N+4 (measured on Arc B-series:
+# VA-API qp19 = 23.9 Mbps / 51.29 dB vs NVENC qp23 = 25.0 Mbps / 51.26 dB).
+# Keeping the same visual quality across the two backends matters because both
+# produce the same dataset.
+_VAAPI_QP_OFFSET = 4
+
+
+def _get_video_backend():
+    """Return (backend, devices), detecting once per process."""
+    global _VIDEO_BACKEND, _VIDEO_DEVICES
+    if _VIDEO_BACKEND is None:
+        _VIDEO_BACKEND, _VIDEO_DEVICES = _detect_video_backend()
+    return _VIDEO_BACKEND, _VIDEO_DEVICES
 
 
 # =============================================================================
@@ -468,51 +550,92 @@ class AllIdrVideoBuffer:
         size = self.output_sizes.get(camera_name)
         gpu_vf = resample_vf
         cpu_vf = resample_vf
+        vaapi_vf = resample_vf
         if size is not None:
             width, height = size
             gpu_vf += f",scale_cuda={width}:{height}:interp_algo=bilinear"
             cpu_vf += f",scale={width}:{height}:flags=area"
+            # Keep the resize on the GPU: a CPU-side scale would convert the
+            # full-range source to limited range (washed-out levels).
+            vaapi_vf += f",scale_vaapi=w={width}:h={height}:format=nv12"
+        else:
+            vaapi_vf += ",scale_vaapi=format=nv12"
         # With dropped ticks the encode must cover the full tick span so
         # _finalize_video can pick each row's own slot from the grid.
         grid_span = (tick_indices[-1] + 1) if tick_indices else episode_length
 
-        gpu_cmd = [
-            "ffmpeg", "-y", "-v", "error",
-            "-hwaccel", "cuda",
-            "-hwaccel_device", str(gpu_index),
-            "-hwaccel_output_format", "cuda",   # keep decoded frames on the GPU
-            "-c:v", "hevc_cuvid",
-            "-i", ts_path,
-            "-vf", gpu_vf,
-            # Ask for one extra frame: ffmpeg 7.x + NVENC can drop the frame
-            # that hits the -frames:v cap during teardown, so the capped
-            # frame must be a sacrificial one past the episode's last tick.
-            # _finalize_video trims the output back to episode_length.
-            "-frames:v", str(grid_span + 1),
-            "-c:v", "hevc_nvenc",
-            "-gpu", str(gpu_index),
-            "-g", "1",
-            "-forced-idr", "1",
-            "-strict_gop", "1",
-            "-preset", "p1",
-            # -qp (constant quantizer) instead of -rc vbr -cq: every frame
-            # gets the identical quantizer, so no brightness/quality
-            # variation between consecutive IDR frames.
-            "-qp", str(self.crf),
-            "-color_range", "pc",       # full range (original is yuvj420p)
-            "-f", "mp4",
-            str(tmp_path),
-        ]
+        backend, devices = _get_video_backend()
+        # Ask for one extra frame: ffmpeg 7.x + NVENC can drop the frame that
+        # hits the -frames:v cap during teardown, so the capped frame must be
+        # a sacrificial one past the episode's last tick. _finalize_video
+        # trims the output back to episode_length.
+        frame_cap = str(grid_span + 1)
+
+        if backend == "nvidia":
+            gpu_cmd = [
+                "ffmpeg", "-y", "-v", "error",
+                "-hwaccel", "cuda",
+                "-hwaccel_device", str(gpu_index),
+                "-hwaccel_output_format", "cuda",   # keep decoded frames on the GPU
+                "-c:v", "hevc_cuvid",
+                "-i", ts_path,
+                "-vf", gpu_vf,
+                "-frames:v", frame_cap,
+                "-c:v", "hevc_nvenc",
+                "-gpu", str(gpu_index),
+                "-g", "1",
+                "-forced-idr", "1",
+                "-strict_gop", "1",
+                "-preset", "p1",
+                # -qp (constant quantizer) instead of -rc vbr -cq: every frame
+                # gets the identical quantizer, so no brightness/quality
+                # variation between consecutive IDR frames.
+                "-qp", str(self.crf),
+                "-color_range", "pc",       # full range (original is yuvj420p)
+                "-f", "mp4",
+                str(tmp_path),
+            ]
+        elif backend == "vaapi":
+            # Decode and encode both run on the render node; fps/setpts pass
+            # VA-API surfaces through untouched.
+            va_device = devices[gpu_index % len(devices)]
+            # Constant-quantizer quality offset; see _VAAPI_QP_OFFSET.
+            qp = max(0, min(51, self.crf - _VAAPI_QP_OFFSET))
+            gpu_cmd = [
+                "ffmpeg", "-y", "-v", "error",
+                "-init_hw_device", f"vaapi=va:{va_device}",
+                "-hwaccel", "vaapi",
+                "-hwaccel_device", "va",
+                "-hwaccel_output_format", "vaapi",
+                "-c:v", info["codec"],
+                "-i", ts_path,
+                "-vf", vaapi_vf,
+                "-frames:v", frame_cap,
+                "-c:v", "hevc_vaapi",
+                "-rc_mode", "CQP",
+                "-qp", str(qp),
+                "-g", "1",          # every frame an IDR (random access)
+                "-bf", "0",         # no B-frames, like the NVENC path
+                "-color_range", "pc",   # full range (original is yuvj420p)
+                "-f", "mp4",
+                str(tmp_path),
+            ]
+        else:
+            gpu_cmd = None
+
         try:
-            with _NVENC_SESSIONS:
-                result = subprocess.run(gpu_cmd, capture_output=True, text=True)
-            if result.returncode != 0 or not tmp_path.exists():
-                gpu_err = result.stderr.strip()[:300] if result.stderr else "unknown"
-                logging.warning(
-                    f"  GPU pipeline failed for {camera_name} ({gpu_err}), "
-                    f"falling back to CPU..."
-                )
+            if gpu_cmd is None:
                 self._encode_cpu(ts_path, tmp_path, cpu_vf, grid_span)
+            else:
+                with _ENCODE_SESSIONS:
+                    result = subprocess.run(gpu_cmd, capture_output=True, text=True)
+                if result.returncode != 0 or not tmp_path.exists():
+                    gpu_err = result.stderr.strip()[:300] if result.stderr else "unknown"
+                    logging.warning(
+                        f"  {backend} pipeline failed for {camera_name} ({gpu_err}), "
+                        f"falling back to CPU..."
+                    )
+                    self._encode_cpu(ts_path, tmp_path, cpu_vf, grid_span)
         finally:
             if os.path.exists(ts_path):
                 os.unlink(ts_path)
@@ -687,8 +810,23 @@ class MultiVideoRosBag2LeRobotConverter:
         # --- Encode pipeline: episodes encode on GPU in the background while
         # --- the main thread keeps reading the bag. Two workers per GPU
         # --- (one episode's 3-camera encode doesn't saturate a 4090).
-        self.n_gpus = _detect_gpu_count()
-        self.logger.info(f"Detected {self.n_gpus} NVIDIA GPU(s)")
+        self.video_backend, self.encode_devices = _get_video_backend()
+        if self.video_backend == "cpu":
+            self.n_gpus = 0
+            self.logger.info(
+                "Video backend: CPU (libx265; no NVIDIA GPU or VA-API HEVC encoder)"
+            )
+        else:
+            self.n_gpus = max(1, len(self.encode_devices))
+            if self.video_backend == "nvidia":
+                self.logger.info(
+                    f"Video backend: NVIDIA NVENC ({self.n_gpus} GPU(s), "
+                    f"CUDA indices {self.encode_devices})"
+                )
+            else:
+                self.logger.info(
+                    f"Video backend: VA-API ({', '.join(self.encode_devices)})"
+                )
         self._encode_workers = 2 * max(1, self.n_gpus)
         self._encode_pool = ThreadPoolExecutor(
             max_workers=self._encode_workers, thread_name_prefix="ep-encode"
@@ -1851,6 +1989,9 @@ def main():
     parser.add_argument("--nvenc_sessions", type=int, default=7,
                         help="Max concurrent NVENC encode sessions; lower to 5/3 on "
                              "drivers older than 550/522 if GPU encodes fail (default: 7)")
+    parser.add_argument("--vaapi_sessions", type=int, default=4,
+                        help="Max concurrent VA-API encode sessions per render node; "
+                             "4 saturates an Arc B-series GPU at 2560x800 (default: 4)")
     parser.add_argument("--verbose", action="store_true",
                         help="Print progress to terminal instead of log file")
     parser.add_argument("--log_file",
@@ -1858,17 +1999,28 @@ def main():
                         help="Log file path (default: convert_rosbag_to_lerobot_YYYYMMDD_HHMMSS.log in script directory)")
     args = parser.parse_args()
 
-    global _NVENC_SESSIONS
-    _NVENC_SESSIONS = threading.BoundedSemaphore(args.nvenc_sessions)
+    global _VIDEO_BACKEND, _VIDEO_DEVICES, _ENCODE_SESSIONS
+    _VIDEO_BACKEND, _VIDEO_DEVICES = _detect_video_backend()
+    if _VIDEO_BACKEND == "nvidia":
+        _ENCODE_SESSIONS = threading.BoundedSemaphore(max(1, args.nvenc_sessions))
+    elif _VIDEO_BACKEND == "vaapi":
+        _ENCODE_SESSIONS = threading.BoundedSemaphore(
+            max(1, args.vaapi_sessions) * max(1, len(_VIDEO_DEVICES))
+        )
+    else:
+        _ENCODE_SESSIONS = threading.BoundedSemaphore(1)
     output_sizes = {'head_camera': args.head_resolution,
                     'left_color': args.wrist_resolution, 'right_color': args.wrist_resolution}
     output_sizes = {camera: size for camera, size in output_sizes.items() if size}
 
     if args.verbose:
-        # Terminal mode: normal logging to stdout
+        # Terminal mode: normal logging to stdout. force=True because imported
+        # modules (ROS/lerobot) install their own root handler first, which
+        # would otherwise make basicConfig a no-op and swallow INFO logs.
         logging.basicConfig(
             level=logging.INFO,
             format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+            force=True,
         )
         if not os.path.exists(args.input_directory):
             print(f"Error: Input directory {args.input_directory} not found!")
