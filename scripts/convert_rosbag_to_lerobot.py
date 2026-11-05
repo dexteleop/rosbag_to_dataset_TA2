@@ -87,6 +87,11 @@ Usage:
                           episodes get that task instead of --task, so one
                           dataset can hold several tasks
       --verbose           print progress to terminal instead of a log file
+
+    Environment:
+      LEROBOT_TMP_TAG     tag in the temp video files' names
+                          (lerobot_ep_<tag>_*.ts in /dev/shm or $TMPDIR), so a
+                          caller can clean up after a killed run
 """
 
 import errno
@@ -252,6 +257,14 @@ def _release_shm(nbytes: int) -> None:
         _shm_reserved -= nbytes
 
 
+def _tmp_prefix() -> str:
+    """Prefix of the temp .ts files. A killed converter leaves its files in
+    /dev/shm (RAM until reboot); LEROBOT_TMP_TAG (a job id) in the name lets
+    whoever started it remove exactly its own files afterwards."""
+    tag = re.sub(r"[^A-Za-z0-9._-]", "_", os.environ.get("LEROBOT_TMP_TAG", ""))
+    return f"lerobot_ep_{tag}_" if tag else "lerobot_ep_"
+
+
 class AllIdrVideoBuffer:
     """
     Buffers pre-encoded video packets (plus their bag timestamps) and re-encodes
@@ -358,7 +371,7 @@ class AllIdrVideoBuffer:
         return self._write_ts(packet_list, info, None)
 
     def _write_ts(self, packet_list, info, tmp_dir) -> str:
-        fd, ts_path = tempfile.mkstemp(suffix=".ts", prefix="lerobot_ep_", dir=tmp_dir)
+        fd, ts_path = tempfile.mkstemp(suffix=".ts", prefix=_tmp_prefix(), dir=tmp_dir)
         os.close(fd)
         try:
             self._mux_packets(packet_list, info, ts_path)
