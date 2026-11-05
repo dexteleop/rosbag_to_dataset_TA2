@@ -83,10 +83,14 @@ Usage:
       --nvenc_sessions N  max concurrent GPU encode sessions (default 7;
                           lower to 5 or 3 on NVIDIA drivers older than 550/522)
       --max_episodes N    stop after N episodes (for quick testing)
+      --task_map FILE     JSON object {bag folder name: task}; those bags'
+                          episodes get that task instead of --task, so one
+                          dataset can hold several tasks
       --verbose           print progress to terminal instead of a log file
 """
 
 import errno
+import json
 import os
 import re
 import sys
@@ -680,6 +684,8 @@ class MultiVideoRosBag2LeRobotConverter:
         self.fps = fps
         self.crf = crf
         self.max_episodes = None
+        # bag name -> task, for bags whose task is not convert_all's default
+        self.task_map = {}
         self.frame_duration = 1.0 / self.fps
 
         if not logging.getLogger().handlers:
@@ -1769,9 +1775,15 @@ class MultiVideoRosBag2LeRobotConverter:
         # episodes, with nothing but one line in a long log to say so.
         processed_rosbags = 0
         skipped: list[tuple[str, str]] = []
+        unknown = sorted(set(self.task_map) - {str(r.get('name')) for r in rosbags})
+        if unknown:
+            self.logger.warning(f"--task_map names bags that were not found: {unknown}")
         for rosbag in rosbags:
+            task = self.task_map.get(str(rosbag.get('name')), task_description)
+            if task != task_description:
+                self.logger.info(f"Task for {rosbag.get('name')}: {task!r}")
             reason = self.convert_single_bag(
-                rosbag, task_description, ENFORCE_ALL_VIDEO_TOPICS_FLAG, WHOLE_BAG_FLAG
+                rosbag, task, ENFORCE_ALL_VIDEO_TOPICS_FLAG, WHOLE_BAG_FLAG
             )
             processed_rosbags += 1
             if reason is None:
@@ -1862,6 +1874,19 @@ def parse_size(value):
     return width, height
 
 
+def load_task_map(path):
+    """--task_map FILE: a JSON object mapping bag folder names to tasks."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError) as exc:
+        raise argparse.ArgumentTypeError(f"{path}: {exc}")
+    if not isinstance(data, dict) or not all(
+            isinstance(k, str) and isinstance(v, str) and v.strip() for k, v in data.items()):
+        raise argparse.ArgumentTypeError(f"{path}: expected a JSON object of bag name -> task")
+    return data
+
+
 def main():
     parser = argparse.ArgumentParser(description="Convert multiple ROS2 bags to LeRobot dataset with all-IDR video re-encoding")
     parser.add_argument("--multibag",
@@ -1882,6 +1907,9 @@ def main():
     parser.add_argument("--task",
                         default="task description",
                         help="Task description")
+    parser.add_argument("--task_map", type=load_task_map, default={}, metavar="FILE",
+                        help="JSON object {bag folder name: task}: those bags use that task "
+                             "instead of --task")
     parser.add_argument("--whole_bag",
                         action="store_true",
                         help="Treat the entire rosbag as one continuous episode (no X/Y markers needed)")
@@ -1919,6 +1947,7 @@ def main():
         converter = MultiVideoRosBag2LeRobotConverter(args.input_directory, args.output, args.fps,
                                                       crf=args.crf, output_sizes=output_sizes)
         converter.max_episodes = args.max_episodes
+        converter.task_map = args.task_map
         if not converter.convert_all(args.task, args.multibag, args.enforce_all_video_topics, args.whole_bag):
             sys.exit(1)
     else:
@@ -1941,6 +1970,7 @@ def main():
             converter = MultiVideoRosBag2LeRobotConverter(args.input_directory, args.output, args.fps,
                                                           crf=args.crf, output_sizes=output_sizes)
             converter.max_episodes = args.max_episodes
+            converter.task_map = args.task_map
             ok = converter.convert_all(args.task, args.multibag, args.enforce_all_video_topics, args.whole_bag)
         finally:
             sys.stdout.flush()
