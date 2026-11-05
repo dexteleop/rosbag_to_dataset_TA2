@@ -1527,6 +1527,17 @@ class MultiVideoRosBag2LeRobotConverter:
 
                     frame_data.clear()
 
+            if not idr_synced:
+                # A recording that ends before every camera has sent a keyframe
+                # (a few seconds long, or a camera that never came up) has no
+                # episode to save: skip the bag rather than fail the whole run.
+                missing = sorted(expected_cameras - cameras_with_idr)
+                packet_buffer.clear()
+                self.dataset.clear_episode_buffer()
+                del reader
+                shutil.rmtree(self.dataset.root/'images', ignore_errors=True)
+                return f"no keyframe from {', '.join(missing)} before the recording ended"
+
             # Finalize the single whole-bag episode
             end_time = timestamp
             self._submit_episode(packet_buffer, start_time, end_time, task_description)
