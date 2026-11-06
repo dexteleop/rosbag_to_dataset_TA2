@@ -384,6 +384,11 @@ def convert_videos_of_camera(src: SourceDataset, out: Path, key: str, video_mb: 
 
 def convert_episodes(src: SourceDataset, out: Path, data_meta: list[dict],
                      video_meta: dict[str, list[dict]]) -> None:
+    # Keys beyond the format's own (the rosbag converters' source_recording,
+    # calibration, ...) become columns too; an episode without one gets null.
+    extra = []
+    for episode in src.episodes:
+        extra += [k for k in episode if k not in ("episode_index", "tasks", "length") and k not in extra]
     rows = []
     for i, episode in enumerate(src.episodes):
         row = {**data_meta[i]}
@@ -391,6 +396,7 @@ def convert_episodes(src: SourceDataset, out: Path, data_meta: list[dict],
             row.update(video_meta[key][i])
         row["tasks"] = list(episode["tasks"])
         row["length"] = episode["length"]
+        row.update({k: episode.get(k) for k in extra})
         row.update(flatten({"stats": src.episode_stats[i]}))
         row["meta/episodes/chunk_index"] = 0
         row["meta/episodes/file_index"] = 0
@@ -407,12 +413,20 @@ def convert_episodes(src: SourceDataset, out: Path, data_meta: list[dict],
     write_json(aggregate_stats(src.episode_stats), out / STATS_PATH)
 
 
+# meta/ subdirectories that are not part of the format, copied as they are
+EXTRA_META_DIRS = ("calibration",)
+
+
 def copy_extra_files(src: SourceDataset, out: Path) -> None:
     """Keep top-level files that are not part of the format (e.g. the
-    converter's review_report.json); the format's own files were rewritten."""
+    converter's review_report.json) and meta/calibration/; the format's own
+    files were rewritten."""
     for path in sorted(src.root.iterdir()):
         if path.is_file() and not path.name.startswith("."):
             shutil.copy2(path, out / path.name)
+    for name in EXTRA_META_DIRS:
+        if (src.root / "meta" / name).is_dir():
+            shutil.copytree(src.root / "meta" / name, out / "meta" / name)
 
 
 # ---------------------------------------------------------------------------
@@ -432,6 +446,10 @@ def verify(src: SourceDataset, out: Path) -> list[str]:
     if [e["episode_index"] for e in episodes] != list(range(len(src.episodes))):
         problems.append("meta/episodes is not one row per episode in order")
         return problems
+    for source_episode, episode in zip(src.episodes, episodes):
+        changed = [k for k, v in source_episode.items() if k != "tasks" and episode.get(k) != v]
+        if changed:
+            problems.append(f"episode {episode['episode_index']}: {', '.join(changed)} changed")
 
     tables: dict[tuple[int, int], pa.Table] = {}
     for episode, source_path in zip(episodes, src.data_files):

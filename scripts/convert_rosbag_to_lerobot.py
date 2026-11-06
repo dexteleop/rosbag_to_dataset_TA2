@@ -88,6 +88,10 @@ Usage:
                           dataset can hold several tasks
       --verbose           print progress to terminal instead of a log file
 
+    Every episode in meta/episodes.jsonl also records its source recording,
+    MCAP file(s) with their sha256, robot id and time span, and refers to the
+    robot calibration stored under meta/calibration/ (see recording_source.py).
+
     Environment:
       LEROBOT_TMP_TAG     tag in the temp video files' names
                           (lerobot_ep_<tag>_*.ts in /dev/shm or $TMPDIR), so a
@@ -111,6 +115,7 @@ import subprocess
 import traceback
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import datetime
 from fractions import Fraction
 
@@ -138,10 +143,13 @@ except ImportError as e:
 # LeRobot imports
 try:
     from lerobot.record import sample_frames_from_video
+    from lerobot.datasets import lerobot_dataset as _lerobot_dataset
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 except ImportError as e:
     print(f"LeRobot dependencies not found: {e}")
     sys.exit(1)
+
+import recording_source
 
 # Constants
 STATE_ACTION_DIM = 76  # 62 base + 10 chassis/kinco + 4 unpaired (see setup_features)
@@ -255,6 +263,25 @@ def _release_shm(nbytes: int) -> None:
     global _shm_reserved
     with _shm_lock:
         _shm_reserved -= nbytes
+
+
+@contextmanager
+def _episode_extra(fields: dict):
+    """Add `fields` to the episode's line in meta/episodes.jsonl (and to
+    meta.episodes) while saving it. LeRobot builds that dict inside
+    save_episode with fixed keys; its write_episode call is the one place it
+    passes through on the way to disk."""
+    original = _lerobot_dataset.write_episode
+
+    def write_episode(episode, local_dir):
+        episode.update(fields)
+        original(episode, local_dir)
+
+    _lerobot_dataset.write_episode = write_episode
+    try:
+        yield
+    finally:
+        _lerobot_dataset.write_episode = original
 
 
 def _tmp_prefix() -> str:
@@ -768,6 +795,14 @@ class MultiVideoRosBag2LeRobotConverter:
         self._episode_ticks = []  # tick index of each added row (holes = dropped ticks)
         self.max_pending = 2 * self._encode_workers
 
+        # --- Episode source (see recording_source.py): every storage file is
+        # --- hashed once, in the background, while the bags are converted.
+        self._hash_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="sha256")
+        self._file_sha = {}       # storage file path -> future of its sha256
+        self._calibrations = None
+        self._bag_files = []      # this bag's [(path, start_ns, end_ns)]
+        self._file_calibration = {}  # path -> (relative path, sha256) or None
+
 
     @staticmethod
     def _find_bag_files(directory):
@@ -1256,6 +1291,7 @@ class MultiVideoRosBag2LeRobotConverter:
             'episode_index': video_episode_index,
             'episode_length': data_ep_len,
             'video_duration': duration,
+            'source': self._episode_source(start_time, end_time),
         })
 
     def _drain_pending(self, block: bool = False):
@@ -1317,10 +1353,16 @@ class MultiVideoRosBag2LeRobotConverter:
         self._perf['stage2_finalize'] += time.perf_counter() - _t
 
         _t = time.perf_counter()
+        source = dict(item['source'])
+        files = source.pop('_files')
+        _t_sha = time.perf_counter()
+        source['source_mcap_sha256'] = [self._file_sha[f].result() for f in files]
+        self._perf['sha256_wait'] += time.perf_counter() - _t_sha
         in_flight_buffer = self.dataset.episode_buffer
         self.dataset.episode_buffer = episode_buffer
         try:
-            self.dataset.save_episode()
+            with _episode_extra(source):
+                self.dataset.save_episode()
         finally:
             self.dataset.episode_buffer = in_flight_buffer
         self._perf['dataset_save'] += time.perf_counter() - _t
@@ -1330,6 +1372,56 @@ class MultiVideoRosBag2LeRobotConverter:
             f"  [PERF cumulative] episode_video_dur={item['video_duration']:.1f}s | "
             + " | ".join(f"{k}={v:.2f}s" for k, v in sorted(self._perf.items()))
         )
+
+    def _hash_files(self, rosbags):
+        """Queue every storage file of the run for hashing, in bag order."""
+        for rosbag in rosbags:
+            for path, _, _ in recording_source.storage_files(rosbag['path'], rosbag['bag_file']):
+                if path not in self._file_sha:
+                    self._file_sha[path] = self._hash_pool.submit(recording_source.file_sha256, path)
+
+    def _begin_bag_source(self, rosbag):
+        """Storage files and calibration of the bag about to be read."""
+        self._bag_name = Path(rosbag['path']).name
+        self._bag_files = recording_source.storage_files(rosbag['path'], rosbag['bag_file'])
+        for path, _, _ in self._bag_files:
+            if path not in self._file_sha:
+                self._file_sha[path] = self._hash_pool.submit(recording_source.file_sha256, path)
+        self._file_calibration = {}
+        robot_id = recording_source.robot_id_of(self._bag_name)
+        for path, _, _ in self._bag_files:
+            stored = None
+            try:
+                data = recording_source.mcap_attachment(
+                    path, recording_source.CALIBRATION_ATTACHMENT) if path.suffix == '.mcap' else None
+                if data is not None:
+                    recording_source.check_calibration_json(data)
+                    stored = self._calibrations.add(data, robot_id)
+            except (OSError, ValueError) as e:
+                self.logger.warning(f"  ⚠️ {path.name}: calibration.json unreadable ({e})")
+                data = None
+            if data is None:
+                self.logger.warning(f"  ⚠️ {path.name}: no calibration.json; its episodes get calibration=null")
+            else:
+                self.logger.info(f"  📐 {path.name}: calibration {stored[0]}")
+            self._file_calibration[path] = stored
+
+    def _episode_source(self, start_time, end_time):
+        """Source fields of an episode spanning start_time..end_time (bag
+        seconds); the files' sha256 is filled in at save time."""
+        start_ns, end_ns = int(round(start_time * 1e9)), int(round(end_time * 1e9))
+        files = [f[0] for f in recording_source.files_in_span(self._bag_files, start_ns, end_ns)]
+        calibration = next((self._file_calibration[f] for f in files if self._file_calibration.get(f)), None)
+        return {
+            '_files': files,
+            'source_recording': self._bag_name,
+            'source_mcap': [f.name for f in files],
+            'robot_id': recording_source.robot_id_of(self._bag_name),
+            'source_start_ns': start_ns,
+            'source_end_ns': end_ns,
+            'calibration': calibration[0] if calibration else None,
+            'calibration_sha256': calibration[1] if calibration else None,
+        }
 
     def _open_bag_reader(self, rosbag):
         """Open a bag, falling back to the storage file when metadata.yaml fails.
@@ -1375,6 +1467,7 @@ class MultiVideoRosBag2LeRobotConverter:
         self.logger.info(f"\n=== Processing {rosbag['name']} ===")
         self._perf = defaultdict(float)
         _t_bag = time.perf_counter()
+        self._begin_bag_source(rosbag)
 
         # Initialize ROS2 bag reader
         try:
@@ -1781,6 +1874,13 @@ class MultiVideoRosBag2LeRobotConverter:
 
     def convert_all(self, task_description: str, MULTIBAG_FLAG: bool, ENFORCE_ALL_VIDEO_TOPICS_FLAG: bool, WHOLE_BAG_FLAG: bool = False):
         """Convert all discovered rosbags to a multi-episode dataset."""
+        try:
+            return self._convert_all(task_description, MULTIBAG_FLAG, ENFORCE_ALL_VIDEO_TOPICS_FLAG, WHOLE_BAG_FLAG)
+        finally:
+            # files not hashed yet are not needed any more (and would hold up exit)
+            self._hash_pool.shutdown(wait=False, cancel_futures=True)
+
+    def _convert_all(self, task_description, MULTIBAG_FLAG, ENFORCE_ALL_VIDEO_TOPICS_FLAG, WHOLE_BAG_FLAG):
         self._t_start = time.time()
         self.logger.info(f"Starting multi-bag conversion: {self.input_directory}")
 
@@ -1793,6 +1893,8 @@ class MultiVideoRosBag2LeRobotConverter:
 
         # Create the dataset
         self.create_dataset_if_needed()
+        self._calibrations = recording_source.CalibrationStore(self.dataset.root)
+        self._hash_files(rosbags)
 
         # Convert each rosbag. A bag that does not convert is reported and
         # counted: silently dropping it leaves a dataset quietly short of those

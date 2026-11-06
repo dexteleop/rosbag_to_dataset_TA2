@@ -21,6 +21,8 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from recording_source import prune_calibration
+
 # Constants
 DEFAULT_CHUNK_SIZE = 1000
 
@@ -342,6 +344,9 @@ def remove_episodes(dataset: Path, episode_indices: list[int]) -> None:
 
     # Save updated episodes.jsonl
     save_jsonl(new_episodes, episodes_path)
+    # Calibration files only the deleted episodes referred to
+    for name in prune_calibration(dataset, new_episodes):
+        print(f"[Info] Removed calibration file no episode refers to any more: {name}")
 
     # Recalculate frame start indices
     frame_starts, total_frames = compute_frame_starts(new_episodes)
