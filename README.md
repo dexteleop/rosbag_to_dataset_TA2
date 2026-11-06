@@ -28,6 +28,7 @@ A toolkit for converting ROS2 bag files (`.db3` / `.mcap`) into LeRobot v2.1 dat
   - [Split Train/Test Subsets](#split-traintest-subsets)
   - [Unify Dataset Tasks](#unify-dataset-tasks)
   - [Rosbag Data Validation](#rosbag-data-validation)
+  - [Detect and Delete Unfit Episodes](#detect-and-delete-unfit-episodes)
 - [Important Notes](#️-important-notes)
 - [Project Structure](#-project-structure)
 - [License](#-license)
@@ -62,7 +63,7 @@ After installation, open a new terminal. You should see `(base)` before your use
 
 ```bash
 # Navigate to project directory
-cd rosbag_to_lerobot
+cd rosbag_to_dataset_TA2
 
 # Create environment from environment.yml
 conda env create -f environment.yml -n rosbag2lerobot
@@ -96,6 +97,8 @@ All converters accept both rosbag2 storage formats and pick the storage plugin a
 
 **Episode markers**: the converters segment episodes with the joystick topic `/xr/left_hand_inputs` (`sensor_msgs/Joy`). A rising edge on `buttons[2]` (**X**) starts an episode (pressing X again while recording discards the buffer and restarts), and a rising edge on `buttons[3]` (**Y**) stops and saves it. Episodes shorter than 30 frames, and episodes still open when the bag ends, are discarded.
 
+**Failed-episode marker** (LeRobot converter only): tapping **Y** 3 times to stop — each tap within 6 s of the previous one — marks the episode as failed and discards it. Exactly 2 taps keeps the episode and logs a warning.
+
 **Expected topics** (shared by all converters):
 
 | Group | Topics |
@@ -106,7 +109,8 @@ All converters accept both rosbag2 storage formats and pick the storage plugin a
 | State (62 dims) | `/left_arm/joint_states`, `/right_arm/joint_states`, `/left_gripper/joint_states`, `/right_gripper/joint_states`, `/left_arm/current_ee_pose`, `/right_arm/current_ee_pose` |
 | Action (62 dims) | `/left_arm/joint_cmd`, `/right_arm/joint_cmd`, `/left_gripper/joint_cmd`, `/right_gripper/joint_cmd`, `/left_target_ee_pose`, `/right_target_ee_pose` |
 | Chassis (9 dims) | `/chassis/joint_states` (state), `/chassis/joint_cmd` (action) |
-| Kinco lift (1 dim, LeRobot converter) | `/kinco/actual_velocity` (state), `/kinco/cmd_velocity` (action) |
+| Kinco lift (LeRobot converter) | `/kinco/actual_velocity`, `/kinco/actual_position` (state), `/kinco/cmd_velocity` (action) |
+| Chassis velocity command (LeRobot converter) | `/chassis_target_vel` (action) |
 
 ## 📖 Usage
 
@@ -136,7 +140,17 @@ python scripts/convert_rosbag_to_lerobot.py \
   --task "task description"
 ```
 
-**Output features**: `observation.state` and `action` are 72-dimensional — 62 arm/gripper dims (16 joint positions, 16 velocities, 16 efforts, 14 EE pose values) + 9 chassis dims (3 motors × position/velocity/effort) + 1 kinco lift velocity. The three camera views are stored as per-episode MP4 videos (`observation.images.left_color` / `right_color` / `head_camera`).
+**Output features**: `observation.state` and `action` are 76-dimensional and share one layout:
+
+| Dims | Content |
+|---|---|
+| 0–61 | Arm/gripper: 16 joint positions, 16 velocities, 16 efforts, 14 EE pose values |
+| 62–70 | Chassis: 3 motors × position/velocity/effort |
+| 71 | `kinco_velocity` (lift) |
+| 72 | `kinco_position` (lift height) — state only |
+| 73–75 | `chassis_target_vel_x/y/yaw` — action only |
+
+Dims that exist on only one side are 0 on the other. The three camera views are stored as per-episode MP4 videos (`observation.images.left_color` / `right_color` / `head_camera`).
 
 **Parameters**:
 - `--input_directory`: Directory containing ROS2 bag files (default: `./data/rosbags`)
@@ -383,6 +397,37 @@ python scripts/validate_rosbags.py \
   --input_directory ./data/rosbags
 ```
 
+### Detect and Delete Unfit Episodes
+
+`detect_suspicious_episodes.py` checks the 14 arm joints of a LeRobot dataset against two indicators and rejects an episode if either fires:
+
+| Category | Indicator | Meaning |
+|---|---|---|
+| 1 command | Peak single-frame step in `action` above the per-joint threshold | Upstream teleop/IK fault |
+| 3 tracking | \|`action` − `observation.state`\| above the per-joint threshold for `--track-hold-s` | Arm fault |
+| 2 length | Episode length outside the quantile fences | Informational only |
+
+Thresholds are calibrated at 45 fps (the command threshold scales with fps). The report goes to `<dataset>/meta/suspicious_episodes.json`.
+
+```bash
+python scripts/detect_suspicious_episodes.py --dataset /path/to/dataset
+python scripts/confirm_and_delete_episodes.py --dataset /path/to/dataset
+```
+
+**`detect_suspicious_episodes.py` parameters**:
+- `--dataset`: Path to the dataset directory
+- `--track-hold-s`: (Optional) Minimum duration of a tracking excursion in seconds (default: 4 frames at 45 fps)
+- `--length-low-quantile` / `--length-high-quantile`: (Optional) Episode-length quantile fences
+- `--output`: (Optional) Report path (default: `<dataset>/meta/suspicious_episodes.json`)
+
+**`confirm_and_delete_episodes.py` parameters** (shows the selected episodes, asks for confirmation, then deletes and reindexes):
+- `--dataset`: Path to the dataset directory
+- `--report`: (Optional) Report path (default: `<dataset>/meta/suspicious_episodes.json`)
+- `--category`: (Optional) Categories to act on (default: `1 3`)
+- `--min-length` / `--max-length`: (Optional) Also select episodes shorter / longer than N frames
+- `--episodes-file`: (Optional) JSON file of explicit episode indices to delete, instead of using the report
+- `--yes`: (Optional) Skip the confirmation prompt
+
 ## ⚠️ Important Notes
 
 1. **Critical**: Always delete the previous dataset cache before re-running LeRobot conversion scripts
@@ -396,7 +441,7 @@ python scripts/validate_rosbags.py \
 ## 📁 Project Structure
 
 ```
-rosbag_to_lerobot/
+rosbag_to_dataset_TA2/
 ├── scripts/
 │   ├── convert_rosbag_to_lerobot.py    # Rosbags with X/Y markers → LeRobot dataset
 │   ├── convert_rosbag_to_hdf5.py       # Rosbags with X/Y markers → per-episode HDF5 (JPEG frames)
@@ -405,6 +450,8 @@ rosbag_to_lerobot/
 │   ├── validate_rosbags.py             # Pre-conversion bag statistics
 │   ├── merge_datasets.py               # Merge multiple LeRobot datasets
 │   ├── delete_wrong_episodes.py        # Delete specific episodes from a dataset
+│   ├── detect_suspicious_episodes.py   # Flag episodes with command/tracking faults
+│   ├── confirm_and_delete_episodes.py  # Review the report and delete flagged episodes
 │   ├── split_train_test.py             # Split a dataset into train/test subsets
 │   └── unify_dataset_tasks.py          # Rewrite all episodes to a single task
 ├── rosbag_rlds_tfds/                                   # TFDS builder for OpenVLA-style RLDS datasets

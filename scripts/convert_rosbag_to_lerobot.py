@@ -1845,7 +1845,7 @@ def main():
                              "1280x400 (default: keep the source size, 2560x800)")
     parser.add_argument("--crf", type=int,
                         default=23,
-                        help="CRF quality for libx265 re-encoding (lower=better quality, default: 23)")
+                        help="Encoder quality: constant QP on GPU / CRF on CPU (lower=better quality, default: 23)")
     parser.add_argument("--max_episodes", type=int, default=None,
                         help="Stop after N episodes (for quick testing)")
     parser.add_argument("--nvenc_sessions", type=int, default=7,
