@@ -76,8 +76,11 @@ Usage:
 
     Useful options:
       --head_resolution WxH
-                          resize the head camera while encoding, e.g.
-                          1920x960 (default: source size, 3840x1920)
+                          size of the head camera video (default 1920x960,
+                          half the 3840x1920 source); "source" keeps it
+      --wrist_resolution WxH
+                          size of both wrist camera videos (default: source
+                          size, 2560x800), e.g. 1280x400
       --crf N             encoder quality (constant QP on GPU / CRF on CPU,
                           lower = better quality, default 23)
       --nvenc_sessions N  max concurrent GPU encode sessions (default 7;
@@ -1990,7 +1993,10 @@ def setup_logging_to_file(log_file_path):
 
 
 def parse_size(value):
-    """'1920x960' -> (1920, 960). Both sides even, as yuv420 requires."""
+    """'1920x960' -> (1920, 960); 'source' -> None (keep the source size).
+    Both sides even, as yuv420 requires."""
+    if value.strip().lower() in ("source", "original"):
+        return None
     match = re.fullmatch(r"(\d+)[xX*](\d+)", value.strip())
     if not match:
         raise argparse.ArgumentTypeError(f"expected WIDTHxHEIGHT, e.g. 1920x960, got {value!r}")
@@ -2039,12 +2045,15 @@ def main():
     parser.add_argument("--whole_bag",
                         action="store_true",
                         help="Treat the entire rosbag as one continuous episode (no X/Y markers needed)")
-    parser.add_argument("--head_resolution", type=parse_size, default=None, metavar="WIDTHxHEIGHT",
-                        help="Resize the head camera while encoding, e.g. 1920x960 "
-                             "(default: keep the source size, 3840x1920)")
+    parser.add_argument("--head_resolution", type=parse_size, default=(1920, 960), metavar="WIDTHxHEIGHT",
+                        help="Size of the head camera video (default: 1920x960, half the "
+                             "3840x1920 source); 'source' keeps the source size")
+    parser.add_argument("--wrist_resolution", type=parse_size, default=None, metavar="WIDTHxHEIGHT",
+                        help="Size of both wrist camera videos (left_color, right_color), e.g. "
+                             "1280x400 (default: keep the source size, 2560x800)")
     parser.add_argument("--crf", type=int,
                         default=23,
-                        help="CRF quality for libx265 re-encoding (lower=better quality, default: 23)")
+                        help="Encoder quality: constant QP on GPU / CRF on CPU (lower=better quality, default: 23)")
     parser.add_argument("--max_episodes", type=int, default=None,
                         help="Stop after N episodes (for quick testing)")
     parser.add_argument("--nvenc_sessions", type=int, default=7,
@@ -2059,7 +2068,9 @@ def main():
 
     global _NVENC_SESSIONS
     _NVENC_SESSIONS = threading.BoundedSemaphore(args.nvenc_sessions)
-    output_sizes = {'head_camera': args.head_resolution} if args.head_resolution else {}
+    output_sizes = {'head_camera': args.head_resolution,
+                    'left_color': args.wrist_resolution, 'right_color': args.wrist_resolution}
+    output_sizes = {camera: size for camera, size in output_sizes.items() if size}
 
     if args.verbose:
         # Terminal mode: normal logging to stdout
