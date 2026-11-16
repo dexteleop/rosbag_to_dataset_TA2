@@ -991,6 +991,20 @@ class MultiVideoRosBag2LeRobotConverter:
 
         return np.array(positions + velocities + efforts, dtype=np.float32)
 
+    def extract_chassis_data(self, msg:JointState):
+        """Extract chassis data (3 motors × position/velocity/effort).
+
+        Not extract_joint_data: that pads each list to 7 joints, so its first
+        9 values are 3 positions, 4 pads and 2 velocities."""
+        n_motors = 3
+        positions  = list(msg.position)[:n_motors] if msg.position else []
+        velocities = list(msg.velocity)[:n_motors] if msg.velocity else []
+        efforts    = list(msg.effort)[:n_motors]   if msg.effort   else []
+        for data_list in [positions, velocities, efforts]:
+            while len(data_list) < n_motors:
+                data_list.append(0.0)
+        return np.array(positions + velocities + efforts, dtype=np.float32)
+
     def extract_gripper_data(self, msg:JointState):
         """Extract gripper data (single joint)."""
         pos = msg.position[0] if msg.position else 0.0
@@ -1053,8 +1067,8 @@ class MultiVideoRosBag2LeRobotConverter:
 
         # --- Chassis + Kinco (indices 62-71, +10 dims) ---
         elif topicName == '/chassis/joint_states':
-            jd = self.extract_joint_data(msg)  # 3 motors × 3 = 9 values
-            self._cur_state_msg[62:71] = jd[0:9]   # pos[0:3], vel[3:6], eff[6:9]
+            # pos[0:3], vel[3:6], eff[6:9]
+            self._cur_state_msg[62:71] = self.extract_chassis_data(msg)
         elif topicName == '/kinco/actual_velocity':
             self._cur_state_msg[71] = msg.data     # Float64
 
@@ -1098,8 +1112,8 @@ class MultiVideoRosBag2LeRobotConverter:
 
         # --- Chassis + Kinco (indices 62-71, +10 dims) ---
         elif topicName == '/chassis/joint_cmd':
-            jd = self.extract_joint_data(msg)  # 3 motors × 3 = 9 values
-            self._cur_action_msg[62:71] = jd[0:9]  # pos[0:3], vel[3:6], eff[6:9]
+            # pos[0:3], vel[3:6], eff[6:9]
+            self._cur_action_msg[62:71] = self.extract_chassis_data(msg)
         elif topicName == '/kinco/cmd_velocity':
             self._cur_action_msg[71] = msg.data    # Float64
 
